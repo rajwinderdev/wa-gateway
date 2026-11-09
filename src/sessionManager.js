@@ -94,8 +94,7 @@ class SessionManager {
    */
   async startSession(sessionKey) {
     let session = this.sessions.get(sessionKey);
-    if (session) {
-      // If already connected or connecting/qr, return state
+    if (session && (session.status === 'connected' || (session.status === 'qr' && session.qrBase64))) {
       return session;
     }
 
@@ -103,6 +102,12 @@ class SessionManager {
       const err = new Error('max_sessions_reached');
       err.statusCode = 429;
       throw err;
+    }
+
+    // Clean any prior failed or disconnected session
+    if (session) {
+      if (session.reconnectTimeout) clearTimeout(session.reconnectTimeout);
+      this.sessions.delete(sessionKey);
     }
 
     session = {
@@ -121,7 +126,12 @@ class SessionManager {
     };
 
     this.sessions.set(sessionKey, session);
-    await this.initSocket(session);
+    try {
+      await this.initSocket(session);
+    } catch (err) {
+      this.sessions.delete(sessionKey);
+      throw err;
+    }
     return session;
   }
 
