@@ -41,12 +41,34 @@ app.use(limiter);
 app.get('/health', (req, res) => {
   return res.json({
     ok: true,
+    version: '1.0.1',
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount()
   });
 });
 
-// 2. Protected Routes (require X-API-KEY header)
+// 2. Version & Release info (public, hit via browser anytime to verify deployed version)
+app.get('/version', (req, res) => {
+  return res.json({
+    ok: true,
+    version: '1.0.1',
+    updated_at: '2026-11-13',
+    changelog: 'Added version tracking, 18s QR wait timeout, detailed error logs, and admin restart endpoint',
+    uptime: Math.floor(process.uptime()),
+    sessions: sessionManager.getSessionCount()
+  });
+});
+
+// 3. Admin Restart Endpoint (protected by X-API-KEY, triggers clean shutdown so LiteSpeed spawns fresh)
+app.post('/admin/restart', authMiddleware, async (req, res) => {
+  logger.info('Restart requested via /admin/restart endpoint');
+  res.json({ ok: true, message: 'Restarting gateway process...' });
+  setTimeout(() => {
+    gracefulShutdown('ADMIN_RESTART');
+  }, 1000);
+});
+
+// 4. Protected Routes (require X-API-KEY header)
 app.use('/sessions', authMiddleware, sessionRoutes);
 app.use('/messages', authMiddleware, messageRoutes);
 app.use('/numbers', authMiddleware, numberRoutes);

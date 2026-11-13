@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-gateway",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Lightweight Multi-Session WhatsApp Gateway REST Service with Baileys and MySQL",
   "main": "src/server.js",
   "scripts": {
