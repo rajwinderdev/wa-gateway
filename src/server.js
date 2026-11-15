@@ -39,11 +39,13 @@ app.use(limiter);
 
 // 1. Health check (no auth required, used by UptimeRobot keep-alive)
 app.get('/health', (req, res) => {
+  const mem = process.memoryUsage();
   return res.json({
     ok: true,
     version: '1.0.2',
     uptime: Math.floor(process.uptime()),
-    sessions: sessionManager.getSessionCount()
+    sessions: sessionManager.getSessionCount(),
+    memory_mb: Math.round(mem.rss / (1024 * 1024))
   });
 });
 
