@@ -42,7 +42,7 @@ app.get('/health', (req, res) => {
   const mem = process.memoryUsage();
   return res.json({
     ok: true,
-    version: '1.0.2',
+    version: '1.1.0',
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount(),
     memory_mb: Math.round(mem.rss / (1024 * 1024))
@@ -51,13 +51,15 @@ app.get('/health', (req, res) => {
 
 // 2. Version & Release info (public, hit via browser anytime to verify deployed version)
 app.get('/version', (req, res) => {
+  const mem = process.memoryUsage();
   return res.json({
     ok: true,
-    version: '1.0.2',
-    updated_at: '2026-11-15',
-    changelog: 'Added /db-check endpoint and AggregateError detailed reporting',
+    version: '1.1.0',
+    updated_at: '2026-11-15 20:25:00',
+    changelog: 'Virtual Number Pool support, live memory monitoring (memory_mb), and enhanced session management',
     uptime: Math.floor(process.uptime()),
-    sessions: sessionManager.getSessionCount()
+    sessions: sessionManager.getSessionCount(),
+    memory_mb: Math.round(mem.rss / (1024 * 1024))
   });
 });
 
