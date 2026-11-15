@@ -40,10 +40,19 @@ router.post('/start', async (req, res) => {
       name: session.name || undefined
     });
   } catch (err) {
-    const errorMsg = err.message || (err.output && err.output.payload && err.output.payload.message) || err.toString() || 'Unknown error';
+    let errorMsg = err.message;
+    if (err.errors && Array.isArray(err.errors)) {
+      errorMsg = err.errors.map(e => e.message || e.toString()).join(' | ');
+    } else if (!errorMsg) {
+      errorMsg = (err.output && err.output.payload && err.output.payload.message) || err.toString() || 'Unknown error';
+    }
     logger.error({ sessionKey: cleanSessionKey, error: errorMsg, stack: err.stack }, 'Error starting session');
     const statusCode = err.statusCode || (err.output && err.output.statusCode) || 500;
-    return res.status(statusCode).json({ ok: false, error: errorMsg, details: err.stack ? err.stack.split('\n').slice(0, 3) : undefined });
+    return res.status(statusCode).json({
+      ok: false,
+      error: errorMsg,
+      details: err.stack ? err.stack.split('\n').slice(0, 3) : undefined
+    });
   }
 });
 

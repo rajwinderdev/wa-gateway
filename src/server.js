@@ -41,7 +41,7 @@ app.use(limiter);
 app.get('/health', (req, res) => {
   return res.json({
     ok: true,
-    version: '1.0.1',
+    version: '1.0.2',
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount()
   });
@@ -51,15 +51,43 @@ app.get('/health', (req, res) => {
 app.get('/version', (req, res) => {
   return res.json({
     ok: true,
-    version: '1.0.1',
-    updated_at: '2026-11-13',
-    changelog: 'Added version tracking, 18s QR wait timeout, detailed error logs, and admin restart endpoint',
+    version: '1.0.2',
+    updated_at: '2026-11-15',
+    changelog: 'Added /db-check endpoint and AggregateError detailed reporting',
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount()
   });
 });
 
-// 3. Admin Restart Endpoint (protected by X-API-KEY, triggers clean shutdown so LiteSpeed spawns fresh)
+// 3. Database Connection Health Check (public, easily test MySQL from browser)
+app.get('/db-check', async (req, res) => {
+  try {
+    const { getPool } = require('./utils/db');
+    const pool = getPool();
+    const [rows] = await pool.query('SELECT 1 + 1 AS test_result');
+    return res.json({
+      ok: true,
+      message: 'Database connected successfully',
+      result: rows[0].test_result
+    });
+  } catch (err) {
+    const errorDetails = err.errors && Array.isArray(err.errors)
+      ? err.errors.map(e => e.message || e.toString()).join(' | ')
+      : (err.message || err.toString());
+    return res.status(500).json({
+      ok: false,
+      error: errorDetails,
+      config: {
+        host: process.env.DB_HOST || '127.0.0.1',
+        port: process.env.DB_PORT || '3306',
+        user: process.env.DB_USER,
+        database: process.env.DB_NAME
+      }
+    });
+  }
+});
+
+// 4. Admin Restart Endpoint (protected by X-API-KEY, triggers clean shutdown so LiteSpeed spawns fresh)
 app.post('/admin/restart', authMiddleware, async (req, res) => {
   logger.info('Restart requested via /admin/restart endpoint');
   res.json({ ok: true, message: 'Restarting gateway process...' });
@@ -68,7 +96,7 @@ app.post('/admin/restart', authMiddleware, async (req, res) => {
   }, 1000);
 });
 
-// 4. Protected Routes (require X-API-KEY header)
+// 5. Protected Routes (require X-API-KEY header)
 app.use('/sessions', authMiddleware, sessionRoutes);
 app.use('/messages', authMiddleware, messageRoutes);
 app.use('/numbers', authMiddleware, numberRoutes);
