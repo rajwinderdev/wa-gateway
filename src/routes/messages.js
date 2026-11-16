@@ -182,6 +182,11 @@ router.post('/send', async (req, res) => {
       const sentMessage = await sock.sendMessage(jid, messageContent);
       const messageId = sentMessage?.key?.id;
 
+      // Cache sent message payload for E2EE pre-key decryption retries
+      if (sentMessage) {
+        sessionManager.cacheSentMessage(session.sessionKey, sentMessage);
+      }
+
       // 5. Store client_ref mapping to survive restarts & associate with webhook delivery events
       if (messageId && client_ref) {
         await sessionManager.saveMessageRef(session.sessionKey, messageId, client_ref);

@@ -7,6 +7,7 @@ const QRCode = require('qrcode');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
+const { NodeCache } = require('@cacheable/node-cache');
 const mob = require('./whalibmob');
 const { useMySQLAuthState } = require('./mysqlAuthState');
 const { sendWebhook } = require('./webhook');
@@ -155,6 +156,14 @@ class SessionManager {
     // Load auth state from MySQL
     session.authState = await useMySQLAuthState(sessionKey);
 
+    // E2EE Pre-key Retry Counter & Sent Message Cache (resolves "Waiting for this message. This may take a while")
+    if (!session.msgRetryCounterCache) {
+      session.msgRetryCounterCache = new NodeCache({ stdTTL: 3600, checkperiod: 600 });
+    }
+    if (!session.messageCache) {
+      session.messageCache = new Map();
+    }
+
     const sock = makeWASocket({
       auth: session.authState.state,
       logger: silentLogger,
@@ -165,7 +174,14 @@ class SessionManager {
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 30000,
-      generateHighQualityLinkPreview: false
+      generateHighQualityLinkPreview: false,
+      msgRetryCounterCache: session.msgRetryCounterCache,
+      getMessage: async (key) => {
+        if (session.messageCache && session.messageCache.has(key.id)) {
+          return session.messageCache.get(key.id);
+        }
+        return { conversation: '' };
+      }
     });
 
     session.sock = sock;
@@ -319,6 +335,48 @@ class SessionManager {
         }
       }
     });
+
+    // Listen for incoming messages (e.g. STOP / Opt-Out replies)
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (!msg.key || msg.key.fromMe) continue;
+        const remoteJid = msg.key.remoteJid;
+        if (!remoteJid || remoteJid.includes('@g.us') || remoteJid.includes('broadcast')) continue;
+
+        const cleanFrom = remoteJid.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+        const text = msg.message?.conversation ||
+                     msg.message?.extendedTextMessage?.text ||
+                     msg.message?.imageMessage?.caption ||
+                     '';
+
+        if (cleanFrom && text) {
+          logger.info({ sessionKey, from: cleanFrom, text }, 'Incoming WhatsApp message received from recipient');
+          sendWebhook({
+            event: 'message.received',
+            session_key: sessionKey,
+            from: cleanFrom,
+            text: text.trim(),
+            timestamp: Date.now()
+          });
+        }
+      }
+    });
+  }
+
+  /**
+   * Cache sent message for E2EE decryption retry handling
+   */
+  cacheSentMessage(sessionKey, sentMessage) {
+    if (!sentMessage || !sentMessage.key || !sentMessage.key.id) return;
+    const session = this.sessions.get(sessionKey);
+    if (!session) return;
+    if (!session.messageCache) session.messageCache = new Map();
+    session.messageCache.set(sentMessage.key.id, sentMessage.message);
+    if (session.messageCache.size > 2000) {
+      const firstKey = session.messageCache.keys().next().value;
+      session.messageCache.delete(firstKey);
+    }
   }
 
   /**
