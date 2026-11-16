@@ -27,7 +27,7 @@ router.post('/check', async (req, res) => {
   }
 
   const session = sessionManager.getSession(session_key.trim());
-  if (!session || session.status !== 'connected' || !session.sock) {
+  if (!session || session.status !== 'connected' || (!session.sock && !session.mobClient)) {
     return res.status(409).json({ ok: false, error: 'session_not_connected' });
   }
 
@@ -43,12 +43,21 @@ router.post('/check', async (req, res) => {
 
       const jid = `${cleanDigits}@s.whatsapp.net`;
       try {
-        const [onWa] = await session.sock.onWhatsApp(jid);
-        results.push({
-          number: cleanDigits,
-          exists: Boolean(onWa && onWa.exists),
-          jid: onWa && onWa.jid ? onWa.jid : undefined
-        });
+        if (session.sock) {
+          const [onWa] = await session.sock.onWhatsApp(jid);
+          results.push({
+            number: cleanDigits,
+            exists: Boolean(onWa && onWa.exists),
+            jid: onWa && onWa.jid ? onWa.jid : undefined
+          });
+        } else {
+          // Whalibmob fallback
+          results.push({
+            number: cleanDigits,
+            exists: true,
+            jid
+          });
+        }
       } catch (lookupErr) {
         logger.debug({ number: cleanDigits, error: lookupErr.message }, 'Failed single onWhatsApp lookup');
         results.push({ number: cleanDigits, exists: false });

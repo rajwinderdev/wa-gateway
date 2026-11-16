@@ -54,9 +54,10 @@ app.get('/version', (req, res) => {
   const mem = process.memoryUsage();
   return res.json({
     ok: true,
-    version: '1.1.0',
-    updated_at: '2026-11-15 20:25:00',
-    changelog: 'Virtual Number Pool support, live memory monitoring (memory_mb), and enhanced session management',
+    version: '1.2.0',
+    updated_at: '2026-11-16 21:15:00',
+    changelog: 'Dual Engine Gateway: Baileys companion + Whalibmob Direct SMS OTP Registration for DualSMS virtual numbers, dynamic warmup capacity',
+    engines: ['baileys', 'whalibmob'],
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount(),
     memory_mb: Math.round(mem.rss / (1024 * 1024))

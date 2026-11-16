@@ -1,0 +1,11929 @@
+'use strict';
+
+const { Boom } = require('@hapi/boom');
+const { statusFrom } = require('./errors');
+const { dbg: _whaDbg, configureLogger: _whaConfigLogger } = require('./logger');
+
+const EventEmitter  = require('events');
+const path          = require('path');
+const fs            = require('fs');
+const crypto        = require('crypto');
+const { Mutex }     = require('async-mutex');
+const { NoiseSocket }     = require('./noise');
+const { MessageSender, generateMessageId, makeJid, buildOrGetAdvIdentity } = require('./messages/MessageSender');
+const { checkIfRegistered, checkNumberStatus, requestSmsCode, verifyCode, assertRegistrationKeys, fetchIosVersion, fetchAndroidVersion, fetchWaVersion } = require('./Registration');
+const { defaultBaseDir, sessionDirFor, isLegacyLayout,
+        preKeyFilesFor, SESSION_SUFFIXES, PHONE_BOUND_SUFFIXES } = require('./SessionPaths');
+const { getDeviceConfig } = require('./DeviceConfig');
+const { prepareProfilePicture, probeImageSize, canDecodeImage } = require('./MediaThumbnail');
+const { createNewStore, saveStore, loadStore, toSixParts, fromSixParts } = require('./Store');
+const { BinaryNode }      = require('./BinaryNode');
+const { AppStateStore, COLLECTIONS } = require('./appstate/AppStateStore');
+const ReachoutTimelock = require('./ReachoutTimelock');
+const { decodeArgo }   = require('./argo/ArgoDecoder');
+const AppStateSync  = require('./appstate/AppStateSync');
+const SyncdProto    = require('./appstate/SyncdProto');
+const AppMutations  = require('./appstate/Mutations');
+const {
+  GroupParticipantResult, GroupJoinRequest,
+  parseParticipantNodes, parseJoinRequestNode
+} = require('./GroupParticipant');
+
+// How many times a message may be re-sent in answer to retry receipts before
+// the client stops. Each resend can itself draw retries, so this is what keeps
+// an undecryptable message from turning into a flood.
+//
+// Matched to the cap on retries we ask for ourselves (5, in _sendRetryRequest):
+// a device that keeps failing is worth the same number of rounds in either
+// direction. Two rounds gave up while the recipient was still asking.
+const MAX_RETRY_RESENDS = 5;
+
+// How many sent messages keep their plaintext for answering a retry receipt.
+// A receipt naming a message no longer held here cannot be answered at all —
+// the message is acked by the server and then silently never arrives. The
+// bound exists for memory, and an entry is small (the encoded Message, not the
+// media it points at), so it is set well above a busy sender's in-flight window
+// rather than at the smallest number that usually works.
+const SENT_CACHE_SIZE = 2000;
+const { NodeCache }       = require('@cacheable/node-cache');
+
+// Group metadata cache lifetime — matches DeviceManager's device cache.
+const GROUP_META_CACHE_TTL = '5m';
+const { SignalProtocol, INITIAL_PREKEY_COUNT, MIN_PREKEY_COUNT } =
+  require('./signal/SignalProtocol');
+const { DeviceManager, jidStrToObj } = require('./DeviceManager');
+const {
+  processHistorySyncNotification,
+  decodeHistorySyncNotification,
+  decodeAppStateSyncKeyShare,
+  saveAppStateSyncKeys,
+  loadAppStateSyncKeys,
+  HistorySyncType
+} = require('./HistorySyncHandler');
+
+// Status posts are messages addressed here.
+const STATUS_BROADCAST_JID = 'status@broadcast';
+
+// The two prefixes a call-link token is wrapped in, as WhatsApp Web uses them.
+const CALL_AUDIO_PREFIX = 'https://call.whatsapp.com/voice/';
+const CALL_VIDEO_PREFIX = 'https://call.whatsapp.com/video/';
+
+// The one prefix group invite codes are wrapped in.
+const INVITE_LINK_PREFIX = 'https://chat.whatsapp.com/';
+
+// The w:mex query that reports whether this account is restricted and until
+// when. The id is the server's handle for that stored GraphQL document; there
+// is no way to derive it, and a wrong one is answered with an error rather than
+// with a different query.
+const MEX_QUERY_REACHOUT_TIMELOCK = '23983697327930364';
+
+// How long an about is allowed to be. The apps stop you at this length; the
+// server takes a longer one, answers <iq type="result"/> and keeps the old text.
+const ABOUT_MAX_LENGTH = 139;
+
+// How many times a single syncAppState call will go back for more. A busy
+// account really does need several rounds, so this is high enough not to cut a
+// genuine sync short; it exists only so a server that never stops saying
+// has_more_patches cannot keep us here indefinitely.
+const MAX_APP_STATE_ROUNDS = 30;
+
+// How long to wait before asking the primary device for the same app-state key
+// again. A key it has not shared is usually one it will not share; asking on
+// every reconnect would be a message to your own phone every few seconds.
+const APP_STATE_KEY_REQUEST_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+// How long the first message to a contact waits for its trusted-contact token.
+// One round-trip to the server, no more: past this the message goes out without
+// a token rather than sitting in the queue, and the issuance finishes in the
+// background for the next send.
+const TC_TOKEN_PRESEND_TIMEOUT_MS = 5000;
+
+// Account email methods use 32s in the mobile stanza caller (K88/L8m).
+const EMAIL_IQ_TIMEOUT_MS = 32000;
+
+// The names privacy settings actually go by on the wire, and the friendly
+// aliases this library has always accepted for them. The wire names are the
+// right-hand column.
+const PRIVACY_NAME_ALIASES = {
+  last_seen: 'last',            last: 'last',
+  profile_picture: 'profile',   profile_pic: 'profile',    profile: 'profile',
+  status: 'status',
+  online: 'online',
+  read_receipts: 'readreceipts', readreceipts: 'readreceipts',
+  groups_add: 'groupadd',       group_add: 'groupadd',     groupadd: 'groupadd',
+  call_add: 'calladd',          calladd: 'calladd',
+  messages: 'messages',
+  defense: 'defense',
+  stickers: 'stickers'
+};
+
+// What each setting will actually accept. The server does not argue with a
+// value it does not know — it drops the stanza and never answers, so a typo
+// looks exactly like a network problem. Checking here turns that into a
+// sentence naming the choices.
+const PRIVACY_ALLOWED_VALUES = {
+  last:         ['all', 'contacts', 'contact_blacklist', 'none'],
+  profile:      ['all', 'contacts', 'contact_blacklist', 'none'],
+  status:       ['all', 'contacts', 'contact_blacklist', 'none'],
+  groupadd:     ['all', 'contacts', 'contact_blacklist', 'none'],
+  readreceipts: ['all', 'none'],
+  online:       ['all', 'match_last_seen'],
+  calladd:      ['all', 'known'],
+  messages:     ['all', 'contacts'],
+  defense:      ['on_standard', 'off'],
+  stickers:     ['contacts', 'contact_allowlist', 'none']
+};
+
+// The words people reach for, mapped to the ones the protocol uses. "on" and
+// "off" are the obvious things to type for read receipts and mean nothing on
+// the wire, which is exactly the mistake worth absorbing.
+const PRIVACY_VALUE_ALIASES = {
+  everyone:            'all',
+  my_contacts:         'contacts',
+  contacts_except:     'contact_blacklist',
+  contact_whitelist:   'contact_allowlist',
+  nobody:              'none',
+  off:                 'none',
+  on:                  'all',
+  same_as_last_seen:   'match_last_seen',
+  last_seen:           'match_last_seen',
+  standard:            'on_standard'
+};
+
+// Where a word means something different for one setting than for the rest.
+// "on" is "all" everywhere except defense, whose on-state has its own name.
+const PRIVACY_VALUE_ALIASES_BY_NAME = {
+  defense: { on: 'on_standard' },
+  online:  { on: 'all', off: 'match_last_seen' }
+};
+
+// Wire name → the key it is reported under in the settings object.
+const PRIVACY_WIRE_TO_KEY = {
+  last:         'lastSeen',
+  profile:      'profile',
+  status:       'status',
+  online:       'online',
+  readreceipts: 'readReceipts',
+  groupadd:     'groupAdd',
+  calladd:      'callAdd',
+  messages:     'messages',
+  defense:      'defense',
+  stickers:     'stickers'
+};
+
+// The stage a call is at, keyed by the child tag the server puts inside <call>.
+//
+// These are the eight the protocol uses; anything else is reported as
+// 'unknown' with the tag itself alongside, so a new one is visible rather than
+// silently dropped. `relaylatency` keeps the name it has always been announced
+// under here — it is the stanza that arrives while the phone is ringing.
+const CALL_STATUS = {
+  offer:        'offer',
+  offer_notice: 'offer_notice',
+  relaylatency: 'ringing',
+  accept:       'accept',
+  preaccept:    'preaccept',
+  transport:    'transport',
+  terminate:    'terminate',
+  reject:       'reject'
+};
+
+// Reduce a JID to its bare user. Blocking, and anything else that names an
+// account rather than one of its devices, wants this form.
+function toNonAdJid(input) {
+  const s      = String(input || '');
+  const at     = s.indexOf('@');
+  const user   = at >= 0 ? s.slice(0, at) : s;
+  const server = at >= 0 ? s.slice(at + 1) : 's.whatsapp.net';
+  const colon  = user.indexOf(':');
+  return (colon >= 0 ? user.slice(0, colon) : user) + '@' + server;
+}
+
+// Accept a full invite URL or a bare code and return the code.
+function stripInviteUrl(codeOrUrl) {
+  return String(codeOrUrl || '')
+    .trim()
+    .replace(/^https?:\/\/chat\.whatsapp\.com\//i, '')
+    .replace(/[?#].*$/, '')
+    .trim();
+}
+
+const PING_INTERVAL_MS    = 25000;
+const KEEPALIVE_INTERVAL  = 20000;
+// How long a keepalive ping may go unanswered before it counts as missed.
+const KEEPALIVE_TIMEOUT_MS = 10000;
+const RECONNECT_BACKOFF   = [1000, 2000, 4000, 8000, 15000, 30000];
+
+// How many attempts an upload gets before it is left for the next check, and
+// how long it waits between them.
+// How long a placeholder resend waits before it is actually asked for, and how
+// long it waits for an answer before the request is forgotten. The first is
+// there because most of these resolve on their own; the second because a phone
+// that is switched off will never answer and the entry must not block a later
+// attempt forever.
+const PLACEHOLDER_SETTLE_MS  = 2000;
+const PLACEHOLDER_TIMEOUT_MS = 8000;
+// An hour, matching the reference client, and a ceiling so a flood of
+// undecryptable stanzas cannot grow the map without bound.
+const PLACEHOLDER_TTL_MS     = 60 * 60 * 1000;
+const PLACEHOLDER_MAX        = 500;
+
+const PRE_KEY_UPLOAD_TRIES   = 4;
+const PRE_KEY_UPLOAD_BACKOFF = (attempt) => Math.min(1000 * Math.pow(2, attempt), 10000);
+
+// How often to ask the server how many it has left. The drain is invisible from
+// here — every bundle handed out is a key gone, and none of that reaches this
+// side — so on a session that stays up for days this is the only thing that
+// notices before the pool is empty and the account stops being reachable.
+const PRE_KEY_CHECK_INTERVAL = 30 * 60 * 1000;   // 30 minutes
+
+// ─── Key helpers ──────────────────────────────────────────────────────────────
+
+function intToBytes(n, byteLen) {
+  const buf = Buffer.alloc(byteLen);
+  for (let i = byteLen - 1; i >= 0; i--) { buf[i] = n & 0xff; n >>= 8; }
+  return buf;
+}
+
+function stripKeyPrefix(key) {
+  if (!key) return Buffer.alloc(32);
+  const buf = Buffer.from(key);
+  if (buf.length === 33 && buf[0] === 0x05) return buf.slice(1);
+  return buf;
+}
+
+// Strip ADVSignedDeviceIdentity field 2 (accountSignatureKey) before sending in retry <keys>.
+// Mirrors MessageSender.stripAdvSignatureKey — same proto-walk logic.
+function _stripAdvField2(buf) {
+  if (!buf || !buf.length) return buf;
+  const out = [];
+  let i = 0;
+  while (i < buf.length) {
+    const tagByte  = buf[i++];
+    const fieldNum = tagByte >>> 3;
+    const wireType = tagByte & 7;
+    if (wireType === 2) {
+      let len = 0, shift = 0;
+      while (i < buf.length) {
+        const b = buf[i++];
+        len |= (b & 0x7f) << shift;
+        shift += 7;
+        if (!(b & 0x80)) break;
+      }
+      if (fieldNum === 2) {
+        i += len; // skip accountSignatureKey
+      } else {
+        out.push(tagByte);
+        let l = len;
+        while (l > 0x7f) { out.push((l & 0x7f) | 0x80); l >>>= 7; }
+        out.push(l);
+        for (let j = 0; j < len; j++) out.push(buf[i + j]);
+        i += len;
+      }
+    } else {
+      out.push(tagByte);
+    }
+  }
+  return Buffer.from(out);
+}
+
+function pairingCodeError(message, code, serverCode, serverText) {
+  const err = new Boom(message, { statusCode: statusFrom(serverCode, 500) });
+  err.code = code;
+  if (serverCode != null) err.serverCode = serverCode;
+  if (serverText != null) err.serverText = serverText;
+  return err;
+}
+
+// The server's own address, whichever way the decoder handed it over.
+function isServerJid(value) {
+  if (typeof value === 'string') return value === 's.whatsapp.net';
+  return !!value && typeof value === 'object' && value.server === 's.whatsapp.net' &&
+    !value.user && !value.device;
+}
+
+function passkeyError(message, code) {
+  const err = new Boom(message);
+  err.code = code;
+  return err;
+}
+
+function findChild(node, desc) {
+  if (!node || !Array.isArray(node.content)) return null;
+  return node.content.find(c => c && c.description === desc) || null;
+}
+
+function findChildDeep(node, desc) {
+  if (!node) return null;
+  if (node.description === desc) return node;
+  if (!Array.isArray(node.content)) return null;
+  for (const child of node.content) {
+    const found = findChildDeep(child, desc);
+    if (found) return found;
+  }
+  return null;
+}
+
+// A one-line sketch of a stanza, for an error message that has to be useful to
+// somebody who cannot see the wire. Shows the tag tree and a short preview of
+// any content, so an unexpected reply can be reported rather than guessed at.
+function describeNodeBriefly(node, depth) {
+  if (!node) return '(nothing)';
+  depth = depth || 0;
+  const attrs = Object.entries(node.attrs || {})
+    .map(([k, v]) => k + '=' + String(v))
+    .join(' ');
+  let out = '<' + node.description + (attrs ? ' ' + attrs : '');
+
+  if (Array.isArray(node.content)) {
+    if (depth >= 3) return out + ' …>';
+    const kids = node.content
+      .filter(c => c && c.description)
+      .map(c => describeNodeBriefly(c, depth + 1));
+    return out + '>' + kids.join('');
+  }
+
+  const buf = getNodeContent(node);
+  if (buf && buf.length) {
+    const text = buf.toString('utf8');
+    // Printable content is far more use than hex; fall back to hex when it is
+    // not text at all.
+    const printable = /^[\x09\x0a\x0d\x20-\x7e]*$/.test(text);
+    const shown = printable
+      ? JSON.stringify(text.length > 120 ? text.slice(0, 120) + '…' : text)
+      : '0x' + buf.slice(0, 40).toString('hex') + (buf.length > 40 ? '…' : '');
+    return out + '>' + buf.length + 'B ' + shown;
+  }
+  return out + '/>';
+}
+
+// Say why a picture was turned down, from what can be read off the file.
+//
+// "not acceptable" is all the server offers, so the useful part is what we can
+// work out ourselves: what the image is, whether it is square, and whether
+// anything was available to fix it before it went out.
+function _pictureRejected(what, picture, original, opts) {
+  const size = picture ? probeImageSize(picture) : null;
+  const bits = ['the server would not take this image (406 not-acceptable)'];
+
+  if (size && size.width && size.height) {
+    bits.push('it went out as ' + size.width + 'x' + size.height +
+      (size.width === size.height ? '' : ', which is not square'));
+  }
+  const isJpeg = picture && picture[0] === 0xff && picture[1] === 0xd8;
+  if (picture && !isJpeg) bits.push('and it is not a JPEG');
+
+  if (opts && opts.raw) {
+    bits.push('this call passed { raw: true }, so the file was sent exactly as given');
+  } else if (!isJpeg && original && !canDecodeImage(original)) {
+    // WebP, HEIC and the like need an outside converter; everything ordinary
+    // is handled without one.
+    bits.push('this format could not be converted here — install ffmpeg, or ' +
+      'save the picture as a JPEG or PNG first');
+  } else {
+    bits.push('the picture was cropped square and re-encoded before sending, ' +
+      'so the file itself is unlikely to be the problem — the account may not ' +
+      'be allowed to set one');
+  }
+
+  return what + ': ' + bits.join('. ') + '.';
+}
+
+function getNodeContent(node) {
+  if (!node) return null;
+  if (Buffer.isBuffer(node.content)) return node.content;
+  if (typeof node.content === 'string') return Buffer.from(node.content);
+  return null;
+}
+
+function intFromBuf(buf) {
+  if (!buf) return 0;
+  let v = 0;
+  for (const b of buf) v = (v << 8) | b;
+  return v;
+}
+
+function toSignalKey(raw) {
+  if (!raw) return null;
+  if (raw.length === 33 && raw[0] === 0x05) return Buffer.from(raw);
+  if (raw.length === 32) return Buffer.concat([Buffer.from([0x05]), raw]);
+  return Buffer.from(raw);
+}
+
+// ─── Primary message capture, the parts that need no client ──────────────────
+
+// A jid as a conversation knows it: user and server, without the agent or the
+// device a stanza may single one device out by.
+function captureJid(jid) {
+  if (!jid) return null;
+  const str = String(jid);
+  const at  = str.indexOf('@');
+  if (at <= 0) return null;
+  const user = str.slice(0, at).split(':')[0].split('.')[0];
+  return user ? user + '@' + str.slice(at + 1) : null;
+}
+
+// Status posts and channels are not chats a companion is handed history for.
+function capturedChat(jid) {
+  return !!jid && !jid.endsWith('@broadcast') && !jid.endsWith('@newsletter');
+}
+
+// A stanza's `t`, or now for one that carries none.
+function captureTs(ts) {
+  return Number.isSafeInteger(ts) && ts > 0 ? ts : Math.floor(Date.now() / 1000);
+}
+
+// The status a receipt of this type reports, in the store's terms; undefined
+// for the types that report none (retry, sender, inactive, …).
+function receiptStatus(type) {
+  const { STATUS } = require('./primary/MessageStore');
+  switch (type) {
+    case '':                           return STATUS.DELIVERY_ACK;
+    case 'read':   case 'read-self':   return STATUS.READ;
+    case 'played': case 'played-self': return STATUS.PLAYED;
+    default:                           return undefined;
+  }
+}
+
+// Top-level Message fields that are not a message of their own in a chat,
+// with their numbers in the official schema (WAWebProtobufsE2E.proto,
+// `message Message`): key distribution, the metadata that rides beside
+// content, and the add-ons that act on another message — a reaction, a vote,
+// a pin, a keep, an encrypted edit or event response. A Message the decoder
+// cannot name is still kept, as it came, when it carries any field outside
+// this list; the companion decodes it for itself.
+const NON_CONTENT_FIELDS = new Map([
+  [2,   'senderKeyDistributionMessage'],
+  [12,  'protocolMessage'],
+  [15,  'fastRatchetKeySenderKeyDistributionMessage'],
+  [23,  'declinePaymentRequestMessage'],
+  [24,  'cancelPaymentRequestMessage'],
+  [35,  'messageContextInfo'],
+  [46,  'reactionMessage'],
+  [47,  'stickerSyncRmrMessage'],
+  [50,  'pollUpdateMessage'],
+  [51,  'keepInChatMessage'],
+  [56,  'encReactionMessage'],
+  [63,  'pinInChatMessage'],
+  [65,  'scheduledCallEditMessage'],
+  [76,  'encEventResponseMessage'],
+  [82,  'secretEncryptedMessage'],
+  [99,  'limitSharingMessage'],
+  [110, 'statusStickerInteractionMessage'],
+  [121, 'pollAddOptionMessage'],
+  [123, 'groupRootKeyShare'],
+  [127, 'rootSecretDistributeMessage'],
+  [133, 'acp2SettingMessage'],
+  [138, 'requestLocationUpdateMessage']
+]);
+
+// What a Message the decoder could not name holds, looked at through the
+// envelopes the decoder opens: null when it is nothing a chat would show,
+// else a decoded shape for captureInfo — `opaque`, with the view-once flag
+// and the device-sent destination those envelopes gave.
+function opaqueMessage(raw) {
+  const { decodeFields, MESSAGE_WRAPPERS, MAX_WRAPPER_DEPTH } = require('./proto/MessageProto');
+  const isEnvelope = n => MESSAGE_WRAPPERS.some(w => w.field === n);
+  const seen = { type: 'opaque' };
+  let buf = raw;
+  for (let depth = 0; Buffer.isBuffer(buf); depth++) {
+    const fields = decodeFields(buf);
+    let inner = null;
+    for (const w of depth < MAX_WRAPPER_DEPTH ? MESSAGE_WRAPPERS : []) {
+      if (!Buffer.isBuffer(fields[w.field])) continue;
+      const envelope = decodeFields(fields[w.field]);
+      if (!Buffer.isBuffer(envelope[w.inner]) || !envelope[w.inner].length) continue;
+      inner = envelope[w.inner];
+      if (w.flag) seen[w.flag] = true;
+      if (w.field === 31) {
+        // DeviceSentMessage { destinationJid = 1, message = 2, phash = 3 }
+        const dest  = Buffer.isBuffer(envelope[1]) ? envelope[1].toString('utf8') : '';
+        const phash = Buffer.isBuffer(envelope[3]) ? envelope[3].toString('utf8') : '';
+        if (dest || phash) seen.deviceSentMeta = Object.assign({ messageRaw: inner }, dest ? { destinationJid: dest } : {}, phash ? { phash } : {});
+      }
+      break;
+    }
+    if (inner) { buf = inner; continue; }
+    // An envelope left here held nothing.
+    const content = Object.keys(fields).map(Number).some(n => n > 0 && !NON_CONTENT_FIELDS.has(n) && !isEnvelope(n));
+    return content ? seen : null;
+  }
+  return null;
+}
+
+// The decoder's reading of a message, or — for one it could not name, or read
+// as nothing but a sender-key distribution, which the first message in a
+// group rides with — what opaqueMessage finds in it.
+function captureView(decoded, raw) {
+  const type = decoded && decoded.type;
+  if (type !== 'unknown' && type !== 'senderKeyDistribution') return decoded;
+  return (Buffer.isBuffer(raw) && opaqueMessage(raw)) || decoded;
+}
+
+// ─── View-once: what of a captured message may reach the store ───────────────
+//
+// View-once content, its media key or its bytes, never lands in the store. A
+// message's raw bytes are read the way the official schema
+// (WAWebProtobufsE2E.proto) lays them out: a field is entered only as the type
+// the schema gives it, and only when that type can lead to a Message or to a
+// media message with a viewOnce bool. The one exception is a Message field
+// the schema does not define, which may be a newer wrapper and is tried as one.
+// The tables below are generated from the schema (see VIEW_ONCE_SCHEMA).
+
+// The Message fields whose presence alone says view-once. All three are
+// FutureProofMessage.
+const VIEW_ONCE_ENVELOPES = new Set([
+  37,   // viewOnceMessage
+  55,   // viewOnceMessageV2
+  59    // viewOnceMessageV2Extension
+]);
+// The media messages that carry a viewOnce bool, with its field number in
+// each. It is checked wherever the walk meets one of these types, which is
+// wherever the schema puts one: the Message fields imageMessage 3,
+// instantImageMessage 135, videoMessage 9, ptvMessage 66, audioMessage 8 and
+// extendedTextMessage 6, and the media inside button, template, interactive
+// and product messages.
+const VIEW_ONCE_FLAGS = new Map([
+  ['ImageMessage',        25],
+  ['VideoMessage',        20],
+  ['AudioMessage',        21],
+  ['ExtendedTextMessage', 30]
+]);
+// Every type that can lead to a Message or to a media message above, mapped
+// to the fields that lead there, as `number: 'Type'`. A trailing `[]` marks a
+// repeated field, whose copies a reader keeps as separate elements instead of
+// merging them. Every other field is skipped unread.
+//
+// The table is generated from WAWebProtobufsE2E.proto and WACommon.proto,
+// read-only. A type is listed when it is Message, one of the media messages
+// above, or has a field whose type is listed. Nested types are written
+// Outer.Inner. Types from the schema's other imports cannot lead back here,
+// because protobuf imports cannot form a cycle.
+//
+// What this covers:
+// - Message's FutureProofMessage wrappers: 37, 40, 53, 55, 58, 59, 62, 67, 74,
+//   85, 87, 90-93, 95, 96, 99-101, 103, 104, 106, 116, 118, 126, 131-134 and 137.
+// - The other places a Message is held: DeviceSentMessage.message 2,
+//   ProtocolMessage.editedMessage 14, ContextInfo.quotedMessage 3 and
+//   questionReplyQuotedMessage 68, SendPaymentMessage.noteMessage 2,
+//   RequestPaymentMessage.noteMessage 4, CommentMessage.message 1, and the
+//   EmbeddedMessage that media annotations hold.
+// - The header media of button, template and interactive messages.
+const VIEW_ONCE_SCHEMA = viewOnceSchema({
+  Message: {
+    3: 'ImageMessage',                    // imageMessage
+    4: 'ContactMessage',                  // contactMessage
+    5: 'LocationMessage',                 // locationMessage
+    6: 'ExtendedTextMessage',             // extendedTextMessage
+    7: 'DocumentMessage',                 // documentMessage
+    8: 'AudioMessage',                    // audioMessage
+    9: 'VideoMessage',                    // videoMessage
+    10: 'Call',                           // call
+    12: 'ProtocolMessage',                // protocolMessage
+    13: 'ContactsArrayMessage',           // contactsArrayMessage
+    14: 'HighlyStructuredMessage',        // highlyStructuredMessage
+    16: 'SendPaymentMessage',             // sendPaymentMessage
+    18: 'LiveLocationMessage',            // liveLocationMessage
+    22: 'RequestPaymentMessage',          // requestPaymentMessage
+    25: 'TemplateMessage',                // templateMessage
+    26: 'StickerMessage',                 // stickerMessage
+    28: 'GroupInviteMessage',             // groupInviteMessage
+    29: 'TemplateButtonReplyMessage',     // templateButtonReplyMessage
+    30: 'ProductMessage',                 // productMessage
+    31: 'DeviceSentMessage',              // deviceSentMessage
+    36: 'ListMessage',                    // listMessage
+    37: 'FutureProofMessage',             // viewOnceMessage
+    38: 'OrderMessage',                   // orderMessage
+    39: 'ListResponseMessage',            // listResponseMessage
+    40: 'FutureProofMessage',             // ephemeralMessage
+    42: 'ButtonsMessage',                 // buttonsMessage
+    43: 'ButtonsResponseMessage',         // buttonsResponseMessage
+    45: 'InteractiveMessage',             // interactiveMessage
+    48: 'InteractiveResponseMessage',     // interactiveResponseMessage
+    49: 'PollCreationMessage',            // pollCreationMessage
+    53: 'FutureProofMessage',             // documentWithCaptionMessage
+    54: 'RequestPhoneNumberMessage',      // requestPhoneNumberMessage
+    55: 'FutureProofMessage',             // viewOnceMessageV2
+    58: 'FutureProofMessage',             // editedMessage
+    59: 'FutureProofMessage',             // viewOnceMessageV2Extension
+    60: 'PollCreationMessage',            // pollCreationMessageV2
+    62: 'FutureProofMessage',             // groupMentionedMessage
+    64: 'PollCreationMessage',            // pollCreationMessageV3
+    66: 'VideoMessage',                   // ptvMessage
+    67: 'FutureProofMessage',             // botInvokeMessage
+    70: 'MessageHistoryBundle',           // messageHistoryBundle
+    74: 'FutureProofMessage',             // lottieStickerMessage
+    75: 'EventMessage',                   // eventMessage
+    77: 'CommentMessage',                 // commentMessage
+    78: 'NewsletterAdminInviteMessage',   // newsletterAdminInviteMessage
+    83: 'AlbumMessage',                   // albumMessage
+    85: 'FutureProofMessage',             // eventCoverImage
+    86: 'StickerPackMessage',             // stickerPackMessage
+    87: 'FutureProofMessage',             // statusMentionMessage
+    88: 'PollResultSnapshotMessage',      // pollResultSnapshotMessage
+    90: 'FutureProofMessage',             // pollCreationOptionImageMessage
+    91: 'FutureProofMessage',             // associatedChildMessage
+    92: 'FutureProofMessage',             // groupStatusMentionMessage
+    93: 'FutureProofMessage',             // pollCreationMessageV4
+    95: 'FutureProofMessage',             // statusAddYours
+    96: 'FutureProofMessage',             // groupStatusMessage
+    97: 'AIRichResponseMessage',          // richResponseMessage
+    99: 'FutureProofMessage',             // limitSharingMessage
+    100: 'FutureProofMessage',            // botTaskMessage
+    101: 'FutureProofMessage',            // questionMessage
+    102: 'MessageHistoryNotice',          // messageHistoryNotice
+    103: 'FutureProofMessage',            // groupStatusMessageV2
+    104: 'FutureProofMessage',            // botForwardedMessage
+    106: 'FutureProofMessage',            // questionReplyMessage
+    111: 'PollCreationMessage',           // pollCreationMessageV5
+    113: 'NewsletterFollowerInviteMessage',// newsletterFollowerInviteMessageV2
+    115: 'PollResultSnapshotMessage',     // pollResultSnapshotMessageV3
+    116: 'FutureProofMessage',            // newsletterAdminProfileMessage
+    118: 'FutureProofMessage',            // spoilerMessage
+    119: 'PollCreationMessage',           // pollCreationMessageV6
+    122: 'EventInviteMessage',            // eventInviteMessage
+    125: 'SplitPaymentMessage',           // splitPaymentMessage
+    126: 'FutureProofMessage',            // newsletterAdminProfileStatusMessage
+    129: 'MusicMessage',                  // musicMessage
+    131: 'FutureProofMessage',            // botPlatformRegistrationSuccessMessage
+    132: 'FutureProofMessage',            // newsletterScheduledMessage
+    133: 'FutureProofMessage',            // acp2SettingMessage
+    134: 'FutureProofMessage',            // audioStickerMessage
+    135: 'ImageMessage',                  // instantImageMessage
+    136: 'RequestLocationMessage',        // requestLocationMessage
+    137: 'FutureProofMessage'             // botGroupParticipantMessage
+  },
+  // interactiveAnnotations, contextInfo, annotations
+  'VideoMessage': { 12: 'InteractiveAnnotation[]', 17: 'ContextInfo', 25: 'InteractiveAnnotation[]' },
+  'ExtendedTextMessage': { 17: 'ContextInfo' },              // contextInfo
+  // interactiveAnnotations, contextInfo, annotations
+  'ImageMessage': { 10: 'InteractiveAnnotation[]', 17: 'ContextInfo', 30: 'InteractiveAnnotation[]' },
+  'AudioMessage': { 17: 'ContextInfo' },                     // contextInfo
+  // documentMessage, imageMessage, videoMessage, locationMessage, contextInfo
+  'ButtonsMessage': { 2: 'DocumentMessage', 3: 'ImageMessage', 4: 'VideoMessage', 5: 'LocationMessage', 8: 'ContextInfo' },
+  'InteractiveMessage.Footer': { 2: 'AudioMessage' },        // audioMessage
+  // documentMessage, imageMessage, videoMessage, locationMessage, productMessage
+  'InteractiveMessage.Header': { 3: 'DocumentMessage', 4: 'ImageMessage', 7: 'VideoMessage', 8: 'LocationMessage', 9: 'ProductMessage' },
+  // editedMessage, peerDataOperationRequestResponseMessage, aiQueryFanout
+  'ProtocolMessage': { 14: 'Message', 17: 'PeerDataOperationRequestResponseMessage', 26: 'AIQueryFanout' },
+  'ContextInfo': { 3: 'Message', 68: 'ContextInfo.QuestionReplyQuotedMessage' }, // quotedMessage, questionReplyQuotedMessage
+  'ContextInfo.QuestionReplyQuotedMessage': { 2: 'Message', 3: 'Message' }, // quotedQuestion, quotedResponse
+  'AlbumMessage': { 17: 'ContextInfo' },                     // contextInfo
+  'MessageHistoryNotice': { 1: 'ContextInfo' },              // contextInfo
+  'MessageHistoryBundle': { 7: 'ContextInfo' },              // contextInfo
+  'EventMessage': { 1: 'ContextInfo', 5: 'LocationMessage' }, // contextInfo, location
+  'CommentMessage': { 1: 'Message' },                        // message
+  'PollResultSnapshotMessage': { 3: 'ContextInfo' },         // contextInfo
+  'PollCreationMessage': { 5: 'ContextInfo' },               // contextInfo
+  'FutureProofMessage': { 1: 'Message' },                    // message
+  'DeviceSentMessage': { 2: 'Message' },                     // message
+  'RequestLocationMessage': { 1: 'ContextInfo' },            // contextInfo
+  'RequestPhoneNumberMessage': { 1: 'ContextInfo' },         // contextInfo
+  'NewsletterFollowerInviteMessage': { 5: 'ContextInfo' },   // contextInfo
+  'NewsletterAdminInviteMessage': { 6: 'ContextInfo' },      // contextInfo
+  // product, catalog, contextInfo
+  'ProductMessage': { 1: 'ProductMessage.ProductSnapshot', 4: 'ProductMessage.CatalogSnapshot', 17: 'ContextInfo' },
+  'ProductMessage.ProductSnapshot': { 1: 'ImageMessage' },   // productImage
+  'ProductMessage.CatalogSnapshot': { 1: 'ImageMessage' },   // catalogImage
+  'TemplateButtonReplyMessage': { 3: 'ContextInfo' },        // contextInfo
+  // fourRowTemplate, hydratedFourRowTemplate, contextInfo, hydratedTemplate, interactiveMessageTemplate
+  'TemplateMessage': { 1: 'TemplateMessage.FourRowTemplate', 2: 'TemplateMessage.HydratedFourRowTemplate', 3: 'ContextInfo', 4: 'TemplateMessage.HydratedFourRowTemplate', 5: 'InteractiveMessage' },
+  // documentMessage, imageMessage, videoMessage, locationMessage
+  'TemplateMessage.HydratedFourRowTemplate': { 1: 'DocumentMessage', 3: 'ImageMessage', 4: 'VideoMessage', 5: 'LocationMessage' },
+  // documentMessage, highlyStructuredMessage, imageMessage, videoMessage, locationMessage, content, footer, buttons
+  'TemplateMessage.FourRowTemplate': { 1: 'DocumentMessage', 2: 'HighlyStructuredMessage', 3: 'ImageMessage', 4: 'VideoMessage', 5: 'LocationMessage', 6: 'HighlyStructuredMessage', 7: 'HighlyStructuredMessage', 8: 'TemplateButton[]' },
+  'StickerMessage': { 17: 'ContextInfo', 26: 'AudioMessage' }, // contextInfo, audioMessage
+  'LiveLocationMessage': { 17: 'ContextInfo' },              // contextInfo
+  'SplitPaymentMessage': { 17: 'ContextInfo' },              // contextInfo
+  'RequestPaymentMessage': { 4: 'Message' },                 // noteMessage
+  'SendPaymentMessage': { 2: 'Message' },                    // noteMessage
+  'ContactsArrayMessage': { 2: 'ContactMessage[]', 17: 'ContextInfo' }, // contacts, contextInfo
+  'Call': { 7: 'ContextInfo' },                              // contextInfo
+  'DocumentMessage': { 17: 'ContextInfo' },                  // contextInfo
+  'LocationMessage': { 17: 'ContextInfo' },                  // contextInfo
+  'ContactMessage': { 17: 'ContextInfo' },                   // contextInfo
+  'EmbeddedMessage': { 2: 'Message' },                       // message
+  'EmbeddedContent': { 1: 'EmbeddedMessage' },               // embeddedMessage
+  'AIRichResponseMessage': { 4: 'ContextInfo' },             // contextInfo
+  'AIQueryFanout': { 2: 'Message' },                         // message
+  'StickerPackMessage': { 11: 'ContextInfo' },               // contextInfo
+  'ButtonsResponseMessage': { 3: 'ContextInfo' },            // contextInfo
+  'EventInviteMessage': { 1: 'ContextInfo' },                // contextInfo
+  'GroupInviteMessage': { 7: 'ContextInfo' },                // contextInfo
+  'InteractiveResponseMessage': { 15: 'ContextInfo' },       // contextInfo
+  // header, footer, carouselMessage, contextInfo
+  'InteractiveMessage': { 1: 'InteractiveMessage.Header', 3: 'InteractiveMessage.Footer', 7: 'InteractiveMessage.CarouselMessage', 15: 'ContextInfo' },
+  'InteractiveMessage.CarouselMessage': { 1: 'InteractiveMessage[]' }, // cards
+  'ListResponseMessage': { 4: 'ContextInfo' },               // contextInfo
+  'ListMessage': { 8: 'ContextInfo' },                       // contextInfo
+  'OrderMessage': { 17: 'ContextInfo' },                     // contextInfo
+  'HighlyStructuredMessage': { 9: 'TemplateMessage' },       // hydratedHsm
+  'PeerDataOperationRequestResponseMessage.PeerDataOperationResult': { 2: 'StickerMessage' }, // stickerMessage
+  'MusicMessage': { 5: 'ContextInfo' },                      // contextInfo
+  'InteractiveAnnotation': { 5: 'EmbeddedContent' },         // embeddedContent
+  'TemplateButton.CallButton': { 1: 'HighlyStructuredMessage', 2: 'HighlyStructuredMessage' }, // displayText, phoneNumber
+  'TemplateButton.URLButton': { 1: 'HighlyStructuredMessage', 2: 'HighlyStructuredMessage' }, // displayText, URL
+  'TemplateButton.QuickReplyButton': { 1: 'HighlyStructuredMessage' }, // displayText
+  // peerDataOperationResult
+  'PeerDataOperationRequestResponseMessage': { 3: 'PeerDataOperationRequestResponseMessage.PeerDataOperationResult[]' },
+  // quickReplyButton, urlButton, callButton
+  'TemplateButton': { 1: 'TemplateButton.QuickReplyButton', 2: 'TemplateButton.URLButton', 3: 'TemplateButton.CallButton' }
+});
+// The Message fields the schema defines that lead to no Message and no media
+// message. They are never entered, and never tried as a wrapper. Generated
+// with VIEW_ONCE_SCHEMA.
+//
+// messageContextInfo 35 is one of them. It rides on practically every message,
+// and its DeviceListMetadata sits at its field 1, where a wrapper keeps its
+// Message. Read as a Message, the metadata's key hashes and packed indexes
+// look like audio, image and call fields.
+//
+// A Message field in neither table is one the schema does not define. Only
+// those are tried as a wrapper (see speculativeViewOnce).
+const MESSAGE_FIELDS_ELSEWHERE = new Set([
+  1,    // conversation: string
+  2,    // senderKeyDistributionMessage: SenderKeyDistributionMessage
+  11,   // chat: Chat
+  15,   // fastRatchetKeySenderKeyDistributionMessage: SenderKeyDistributionMessage
+  23,   // declinePaymentRequestMessage: DeclinePaymentRequestMessage
+  24,   // cancelPaymentRequestMessage: CancelPaymentRequestMessage
+  35,   // messageContextInfo: MessageContextInfo
+  41,   // invoiceMessage: InvoiceMessage
+  44,   // paymentInviteMessage: PaymentInviteMessage
+  46,   // reactionMessage: ReactionMessage
+  47,   // stickerSyncRmrMessage: StickerSyncRMRMessage
+  50,   // pollUpdateMessage: PollUpdateMessage
+  51,   // keepInChatMessage: KeepInChatMessage
+  56,   // encReactionMessage: EncReactionMessage
+  61,   // scheduledCallCreationMessage: ScheduledCallCreationMessage
+  63,   // pinInChatMessage: PinInChatMessage
+  65,   // scheduledCallEditMessage: ScheduledCallEditMessage
+  69,   // callLogMesssage: CallLogMessage
+  71,   // encCommentMessage: EncCommentMessage
+  72,   // bcallMessage: BCallMessage
+  76,   // encEventResponseMessage: EncEventResponseMessage
+  80,   // placeholderMessage: PlaceholderMessage
+  82,   // secretEncryptedMessage: SecretEncryptedMessage
+  98,   // statusNotificationMessage: StatusNotificationMessage
+  105,  // statusQuestionAnswerMessage: StatusQuestionAnswerMessage
+  107,  // questionResponseMessage: QuestionResponseMessage
+  109,  // statusQuotedMessage: StatusQuotedMessage
+  110,  // statusStickerInteractionMessage: StatusStickerInteractionMessage
+  120,  // conditionalRevealMessage: ConditionalRevealMessage
+  121,  // pollAddOptionMessage: PollAddOptionMessage
+  123,  // groupRootKeyShare: GroupRootKeyShare
+  124,  // paymentReminderMessage: PaymentReminderMessage
+  127,  // rootSecretDistributeMessage: RootSecretDistributeMessage
+  128,  // splitPaymentUpdateMessage: SplitPaymentUpdateMessage
+  130,  // statusLinkPreviewMetadata: StatusLinkPreviewMetadata
+  138   // requestLocationUpdateMessage: RequestLocationUpdateMessage
+]);
+// A reply carries what it quotes in its ContextInfo. Every field of
+// ContextInfo in VIEW_ONCE_SCHEMA is such a quote: quotedMessage 3 and
+// questionReplyQuotedMessage 68. These are what dropQuotedViewOnce cuts.
+const QUOTE_HOLDER = 'ContextInfo';
+
+// The bounds of every walk, shared by the detection walk and the cut:
+// - A Message may sit at most VIEW_ONCE_DEPTH levels deep. The top Message is
+//   level 1, and every Message entered adds one: a wrapper's, a quote's, a
+//   device-sent message's, an edit's.
+// - At most VIEW_ONCE_FRAMES typed messages of any type may be open on one
+//   path. This bounds the template and carousel types, which hold their own
+//   kind with no Message in between.
+// - At most VIEW_ONCE_BYTES are read in all.
+// Past any bound, the walk fails closed.
+const VIEW_ONCE_DEPTH  = 6;
+const VIEW_ONCE_FRAMES = 64;
+const VIEW_ONCE_BYTES  = 8 * 1024 * 1024;
+const VIEW_ONCE_BUDGET = new Boom('view-once walk: byte budget spent', { statusCode: 400 });
+const VIEW_ONCE_DEEP   = new Boom('view-once walk: nested past the bound', { statusCode: 400 });
+const VIEW_ONCE_TOP    = { level: 1, frames: 1 };
+
+// VIEW_ONCE_SCHEMA as maps: type -> field number -> { type, repeated }.
+function viewOnceSchema(types) {
+  const schema = new Map();
+  for (const name of Object.keys(types)) {
+    const fields = new Map();
+    for (const number of Object.keys(types[name])) {
+      const child = types[name][number];
+      const repeated = child.endsWith('[]');
+      fields.set(Number(number), { type: repeated ? child.slice(0, -2) : child, repeated });
+    }
+    schema.set(name, fields);
+  }
+  return schema;
+}
+
+// Where a walk standing at `at` stands once it enters a field of type `type`:
+// one level deeper when that type is Message. Throws VIEW_ONCE_DEEP past the
+// bounds.
+function viewOnceStep(at, type) {
+  const level = at.level + (type === 'Message' ? 1 : 0);
+  const frames = at.frames + 1;
+  if (level > VIEW_ONCE_DEPTH || frames > VIEW_ONCE_FRAMES) throw VIEW_ONCE_DEEP;
+  return { level, frames };
+}
+
+// A field the schema types, on the wire type that type is written with: 2 for
+// a message, 0 for a bool. Anything else is not the message the schema
+// describes, and does not read.
+function viewOnceWire(f, wire) {
+  if (f.wire !== wire) throw new Boom('view-once walk: wire type ' + f.wire + ' for field ' + f.number, { statusCode: 400 });
+}
+
+// The fields of one protobuf message, each with where it sits in `buf`
+// (`start` to `end`, the tag ending at `tagEnd`), or a throw for anything not
+// well formed. `budget.left` is what may still be read, across calls.
+//
+// A group (wire types 3 and 4, which no type in the schema uses) is skipped up
+// to its matching end-group, nested groups included, the way standard readers
+// skip one. It is listed with wire 3 and no value, so that a rewrite copies
+// it as it was. Malformed nesting does not read: a group left open, an
+// end-group of another number, or an end-group alone.
+function protoFields(buf, budget) {
+  budget.left -= buf.length;
+  if (budget.left < 0) throw VIEW_ONCE_BUDGET;
+  const out = [];
+  let i = 0;
+  const varint = () => {
+    let value = 0, scale = 1, byte;
+    for (let n = 0; ; n++) {
+      if (i >= buf.length || n >= 10) throw new Boom('varint', { statusCode: 400 });
+      byte = buf[i++];
+      value += (byte & 0x7f) * scale;
+      scale *= 128;
+      if (!(byte & 0x80)) return value;
+    }
+  };
+  const tag = () => {
+    const t = varint(), number = Math.floor(t / 8);
+    if (number < 1 || number > 0x1fffffff) throw new Boom('field number', { statusCode: 400 });
+    return { number, wire: t % 8 };
+  };
+  // Past the value of a field of this wire type; its length, if it has one.
+  const skip = wire => {
+    if (wire === 0) { varint(); return -1; }
+    const length = wire === 1 ? 8 : wire === 5 ? 4 : wire === 2 ? varint() : -1;
+    if (length < 0 || i + length > buf.length) throw new Boom('wire', { statusCode: 400 });
+    i += length;
+    return length;
+  };
+  while (i < buf.length) {
+    const start = i;
+    const { number, wire } = tag();
+    const tagEnd = i;
+    if (wire === 0) {
+      const value = varint();
+      out.push({ number, wire, value, start, tagEnd, end: i });
+    } else if (wire === 3) {
+      const open = [number];
+      while (open.length) {
+        if (i >= buf.length) throw new Boom('group left open', { statusCode: 400 });
+        const inner = tag();
+        if (inner.wire === 3) open.push(inner.number);
+        else if (inner.wire === 4) { if (open.pop() !== inner.number) throw new Boom('end-group of another number', { statusCode: 400 }); }
+        else skip(inner.wire);
+      }
+      out.push({ number, wire, value: null, start, tagEnd, end: i });
+    } else {
+      const length = skip(wire);
+      out.push({ number, wire, value: buf.subarray(i - length, i), start, tagEnd, end: i });
+    }
+  }
+  return out;
+}
+
+// `buf` again with some of its length-delimited fields given new values, or
+// dropped (null). Every other byte is copied as it was: only the length in
+// front of a changed field is written anew. Unchanged, it is `buf` itself.
+function withFields(buf, fields, changes) {
+  if (!changes.size) return buf;
+  const { encodeVarint } = require('./proto/MessageProto');
+  const parts = [];
+  for (const f of fields) {
+    if (!changes.has(f)) { parts.push(buf.subarray(f.start, f.end)); continue; }
+    const value = changes.get(f);
+    if (value !== null) parts.push(buf.subarray(f.start, f.tagEnd), encodeVarint(value.length), value);
+  }
+  return Buffer.concat(parts);
+}
+
+// Whether `buf`, read as a `type` standing at `at`, holds view-once. That
+// means an envelope or a set media flag in it, or in any field the schema
+// says leads to a Message or a media message, quotes included. It also means
+// one inside a Message field the schema leaves undefined that reads as a
+// wrapper.
+//
+// Throws when something the schema describes does not read, including a
+// field on the wrong wire type, and past the bounds.
+function viewOnceIn(buf, type, at, budget) {
+  const schema = VIEW_ONCE_SCHEMA.get(type);
+  const flag = VIEW_ONCE_FLAGS.get(type);
+  for (const f of protoFields(buf, budget)) {
+    if (type === 'Message' && VIEW_ONCE_ENVELOPES.has(f.number)) { viewOnceWire(f, 2); return true; }
+    if (f.number === flag) {
+      viewOnceWire(f, 0);
+      if (f.value !== 0) return true;
+      continue;
+    }
+    const child = schema.get(f.number);
+    if (child) {
+      viewOnceWire(f, 2);
+      if (viewOnceIn(f.value, child.type, viewOnceStep(at, child.type), budget)) return true;
+    } else if (type === 'Message' && f.wire === 2 && !MESSAGE_FIELDS_ELSEWHERE.has(f.number)) {
+      if (speculativeViewOnce(f.value, at, budget)) return true;
+    }
+  }
+  return false;
+}
+
+// A Message field the schema does not define, tried as a wrapper (a newer
+// FutureProofMessage, say) with its Message at field 1. If it does not read
+// that way, at any depth inside, it is simply not a wrapper and gives no
+// verdict. Only the bounds still fail closed.
+function speculativeViewOnce(value, at, budget) {
+  try {
+    const inner = protoFields(value, budget).filter(g => g.number === 1);
+    if (!inner.length || inner.some(g => g.wire !== 2)) return false;
+    for (const g of inner) protoFields(g.value, budget);
+    const next = viewOnceStep(at, 'Message');
+    return inner.some(g => viewOnceIn(g.value, 'Message', next, budget));
+  } catch (err) {
+    if (err === VIEW_ONCE_BUDGET || err === VIEW_ONCE_DEEP) throw err;
+    return false;
+  }
+}
+
+// Whether a Message's bytes hold view-once anywhere (see viewOnceIn). Fails
+// closed: bytes that do not read as the schema describes them, or a walk past
+// the bounds, count as view-once.
+function hidesViewOnce(raw) {
+  if (!Buffer.isBuffer(raw)) return false;
+  try { return viewOnceIn(raw, 'Message', VIEW_ONCE_TOP, { left: VIEW_ONCE_BYTES }); } catch (_) { return true; }
+}
+
+// `buf`, read as a `type` standing at `at`, with the quotes `walk.quote` picks
+// cut out. The walk follows VIEW_ONCE_SCHEMA as viewOnceIn does, but it does
+// not enter a quote or a field the schema leaves undefined. It hands each
+// quote to `walk.quote(key, field, child, at)`, which says whether to cut it.
+//
+// A key names where a reader puts what it holds: the field numbers down to
+// it, with an element's index after a repeated field's number. Copies that a
+// reader merges share a key; elements it keeps apart do not.
+function viewOnceQuotes(buf, type, at, key, walk) {
+  const schema = VIEW_ONCE_SCHEMA.get(type);
+  const fields = protoFields(buf, walk.budget);
+  const changes = new Map();
+  for (const f of fields) {
+    const child = schema.get(f.number);
+    if (!child) continue;
+    viewOnceWire(f, 2);
+    let path = key + '/' + f.number;
+    if (child.repeated) {
+      const index = walk.counts.get(path) || 0;
+      walk.counts.set(path, index + 1);
+      path += '#' + index;
+    }
+    if (type === QUOTE_HOLDER) {
+      if (walk.quote(path, f, child, at)) changes.set(f, null);
+      continue;
+    }
+    const value = viewOnceQuotes(f.value, child.type, viewOnceStep(at, child.type), path, walk);
+    if (value !== f.value) changes.set(f, value);
+  }
+  return withFields(buf, fields, changes);
+}
+
+// Whether a quote hides view-once, judged the way a reader sees it: with all
+// its copies merged. It does when any one copy does, when all of them read
+// together do, or when it cannot be read within the bounds. Only a spent byte
+// budget is passed on.
+function quoteHidesViewOnce(quote, budget) {
+  const hides = buf => {
+    try { return viewOnceIn(buf, quote.child.type, viewOnceStep(quote.at, quote.child.type), budget); } catch (err) {
+      if (err === VIEW_ONCE_BUDGET) throw err;
+      return true;
+    }
+  };
+  return quote.copies.some(hides) || (quote.copies.length > 1 && hides(Buffer.concat(quote.copies)));
+}
+
+// A Message's bytes with every quote that hides view-once cut out of the
+// reply carrying it.
+//
+// Only the quote field goes: ContextInfo.quotedMessage or
+// questionReplyQuotedMessage. A quote a reader merges from several copies is
+// judged whole, and then every copy goes. The stanza id, the participant, the
+// mentions and the reply itself stay byte for byte. Only the length prefixes
+// on the way down are written anew.
+//
+// Throws when something on the way does not read, or lies past the bounds.
+// When there is nothing to cut, it returns `raw` itself.
+function dropQuotedViewOnce(raw) {
+  if (!Buffer.isBuffer(raw)) return raw;
+  const budget = { left: VIEW_ONCE_BYTES };
+  const quotes = new Map();
+  viewOnceQuotes(raw, 'Message', VIEW_ONCE_TOP, '', { budget, counts: new Map(), quote(key, f, child, at) {
+    if (!quotes.has(key)) quotes.set(key, { child, at, copies: [] });
+    quotes.get(key).copies.push(f.value);
+    return false;
+  } });
+  const cut = new Set();
+  for (const [key, quote] of quotes) if (quoteHidesViewOnce(quote, budget)) cut.add(key);
+  if (!cut.size) return raw;
+  return viewOnceQuotes(raw, 'Message', VIEW_ONCE_TOP, '', { budget: { left: VIEW_ONCE_BYTES }, counts: new Map(), quote: key => cut.has(key) });
+}
+
+// What of a captured message may reach the store.
+// - A quote of view-once content is cut out of the reply that carries it
+//   (dropQuotedViewOnce).
+// - View-once anywhere else, or a message whose way to its quotes cannot be
+//   read, makes the message the stub the store keeps for one.
+// - An edit, which has no stub to leave, is not applied at all.
+// Returns the info and the raw to store.
+function storable(info, raw) {
+  let unreadable = false;
+  try {
+    if (info.kind === 'content') raw = dropQuotedViewOnce(raw);
+    else if (info.kind === 'protocol' && info.protocol.type === 14) {
+      info = Object.assign({}, info, { protocol: Object.assign({}, info.protocol, { editedRaw: dropQuotedViewOnce(info.protocol.editedRaw) }) });
+    }
+  } catch (_) { unreadable = true; }
+  if (info.kind === 'content' && (unreadable || info.viewOnce || hidesViewOnce(raw))) {
+    info = info.editOf ? { kind: 'skip' } : Object.assign({}, info, { viewOnce: true });
+  } else if (info.kind === 'protocol' && info.protocol.type === 14 && (unreadable || hidesViewOnce(info.protocol.editedRaw))) {
+    info = { kind: 'skip' };
+  }
+  return { info, raw };
+}
+
+// What the store is being handed, from captureView.
+//
+// A protocol message acts on others and is never kept itself; one with no
+// type, or a revoke or edit that names no message, acts on nothing. A
+// reaction, a poll vote, a bare sender-key distribution and anything with
+// nothing a chat would show are not messages of their own. `editOf` is set
+// for content that replaces the message of that id rather than being a new one.
+function captureInfo(decoded, editOf) {
+  const type = decoded && decoded.type;
+  if (type === 'protocol') {
+    const protocol = { type: decoded.protocolType };
+    if (!Number.isInteger(protocol.type)) return { kind: 'skip' };
+    if (protocol.type === 0 || protocol.type === 14) {
+      if (!decoded.key || !decoded.key.id) return { kind: 'skip' };
+      protocol.key = decoded.key;
+    }
+    if (protocol.type === 14) {
+      if (!Buffer.isBuffer(decoded.editedMessageRaw)) return { kind: 'skip' };
+      protocol.editedRaw = decoded.editedMessageRaw;
+    }
+    if (protocol.type === 3) protocol.ephemeralExpiration = decoded.ephemeralExpiration;
+    return { kind: 'protocol', protocol };
+  }
+  // Add-ons act on a message that is already in the chat; none is a message
+  // of its own.
+  if (!type || type === 'unknown' || type === 'reaction' || type === 'pollVote' || type === 'senderKeyDistribution' ||
+      type === 'encReaction' || type === 'encComment' || type === 'encEventResponse' ||
+      type === 'secretEncrypted' || type === 'pinInChat' || type === 'keepInChat') {
+    return { kind: 'skip' };
+  }
+  const info = { kind: 'content' };
+  if (decoded.viewOnce) info.viewOnce = true;
+  const expiration = decoded.contextInfo && decoded.contextInfo.expiration;
+  if (Number.isSafeInteger(expiration) && expiration > 0) info.expiration = expiration;
+  if (editOf) info.editOf = editOf;
+  return info;
+}
+
+// ─── WhalibmobClient ──────────────────────────────────────────────────────────
+
+class WhalibmobClient extends EventEmitter {
+  constructor(opts) {
+    super();
+    opts                = opts || {};
+    this._store         = null;
+    this._socket        = null;
+    this._sender        = null;
+    this._signal        = null;
+    this._devMgr        = null;
+    // The authentication folder the caller chose. `_sessionDir` below is the
+    // directory this one number's files live in, which is a directory inside
+    // it — see SessionPaths. Both are kept: the base is what listing and
+    // renaming work against, the per-number one is what every file path is
+    // built from.
+    //
+    // The base is made absolute here, once. A relative one ('./auth') used to be
+    // carried as written, so it named whichever directory the process happened
+    // to be in, and primary linking — which keeps its journal at an absolute
+    // path and will not guess one — refused to start on it.
+    this._baseDir       = path.resolve(opts.sessionDir || defaultBaseDir());
+    this._sessionDir    = this._baseDir;
+    // 'mobile' — registered over SMS as the account's primary device (default,
+    // and what every existing caller gets). 'web' — linked to an existing
+    // account as a companion, via pairing code.
+    this._mode          = 'mobile';
+    this._webSessionFile = null;
+    // Set once the server has told us to stop trying: an account logout, or a
+    // client the server will not accept. Suppresses the reconnect loop.
+    this._fatal          = false;
+    this._closing        = false;
+    // A session whose number is not in WhatsApp's canonical form is re-filed
+    // automatically on the first refused login. Set { autoFixNumber: false } to
+    // be told about it instead.
+    this._autoFixNumber  = opts.autoFixNumber !== false;
+    // A session checks its platform's store for the current build before every
+    // handshake and writes it back — see _refreshAnnouncedVersion(). iOS reads
+    // the App Store listing, Android the Play Store one, and reconnects are
+    // covered as well as the first connect. Set { refreshVersion: false } to
+    // keep announcing whatever the session registered with.
+    this._refreshVersion = opts.refreshVersion !== false;
+    this._numberFixAttempted = false;
+    this._pingTimer               = null;
+    this._keepTimer               = null;
+    // Both pre-key checks ask the server a question, wait for the answer, and
+    // top the account up if they do not like it. Three things start them —
+    // login, the half-hourly timer, and the server saying it is running low —
+    // and nothing stopped two from being in the air at once. Overlapping runs
+    // each saw the same shortage and each answered it, so the account
+    // generated and uploaded two batches for one gap. Serialised, the second
+    // run asks after the first has finished: the count it gets back is the one
+    // the first run just produced, so it stands down instead of repeating it.
+    // One mutex per client — two accounts in the same process are unrelated
+    // and must not wait on each other.
+    this._preKeyMutex             = new Mutex();
+    // How far this machine's clock is from the server's, in milliseconds.
+    //
+    // The server stamps `t` on the stanzas that matter — <success> and
+    // pair-success — and the unified_session id is derived from a clock that is
+    // supposed to be the server's, not ours. Computing it from Date.now() alone
+    // makes the id drift by however wrong the local clock is, which on a phone
+    // or a container without NTP can be minutes. Zero until the server says
+    // otherwise, which is the same as not correcting at all.
+    this._serverTimeOffsetMs      = 0;
+    // Message ids we have asked the phone to resend, and have not seen since.
+    // An entry is the request itself: while it is there, no second request for
+    // that id goes out. Bounded and time-limited — see _placeholderResendCache.
+    this.__placeholderResend      = new Map();
+    // Incoming work runs one item at a time, in arrival order.
+    //
+    // Stanzas arrive faster than they are handled, and the handling is
+    // asynchronous, so without these each one raced the ones before it: two
+    // messages from the same contact could decrypt at once and advance the
+    // same ratchet from the same starting point, and two retry receipts could
+    // tear a session down while the resend for the previous one was still
+    // building it back up.
+    //
+    // Three separate locks, not one. A message whose decryption waits on
+    // something that only arrives as a notification would deadlock against a
+    // shared lock — the notification could never be processed to release it.
+    // Keeping them apart means each queue only ever waits on its own kind.
+    this._messageMutex            = new Mutex();
+    this._receiptMutex            = new Mutex();
+    this._notificationMutex       = new Mutex();
+    this._connected     = false;
+    this._reconnecting  = false;
+    this._reconnectTry  = 0;
+    this._hasConnectedOnce = false;   // true after first successful open; used to detect reconnects
+    this._phoneNumber   = null;
+    this._mediaConn     = null;
+    this._pendingIqs       = new Map();   // id → resolve fn
+    this._pendingAcks      = new Map();   // msgId → resolve fn
+    // groupJid → parsed metadata.  Mirrors DeviceManager's device cache: a TTL
+    // so membership changes we never saw a notification for still heal, plus
+    // in-flight dedup so a burst of sends to the same group issues one IQ.
+    // `stdTTL`, not `ttl` — see the note in DeviceManager. Written the other
+    // way this held a group's participant list for the life of the connection,
+    // so anyone who joined or left after it was first read stayed wrong until
+    // a reconnect or an explicit { force: true }.
+    this._groupMetaCache    = new NodeCache({ stdTTL: GROUP_META_CACHE_TTL });
+    this._groupMetaInflight = new Map();  // groupJid → Promise<metadata>
+    this._groupMembers     = new Map();   // groupJid → Set<memberJid>
+    this._lidToPn          = new Map();   // LID user → phone number
+    this._pnToLid          = new Map();   // phone number → LID user
+    this._myLid            = null;        // own LID JID received from <success> node
+    this._groupAddressingMode = new Map(); // groupJid → 'lid' | 'pn'
+    this._retryPending     = new Map();   // msgId → {node, count, pkId}
+    this._retryPreKeyIdx   = 0;           // rotating index, fallback when every prekey is reserved
+    // keyIds handed out by unresolved retries — never advertise one twice, or
+    // the second sender's pkmsg arrives after the key was consumed and deleted.
+    this._retryAdvertisedPreKeys = new Set();
+    this._sentMsgCache     = new Map();   // msgId → {plaintext, toJid, msgId, mediaType, options, recipientPhone}
+    // A sender that keeps more messages in flight than the cache holds outruns
+    // its own ability to answer retries, so both bounds are open to being
+    // raised for that kind of load.
+    this._sentCacheSize    = Number(opts.sentCacheSize)  > 0 ? Number(opts.sentCacheSize)  : SENT_CACHE_SIZE;
+    this._maxRetryResends  = Number(opts.maxRetryResends) > 0 ? Number(opts.maxRetryResends) : MAX_RETRY_RESENDS;
+    this._tcTokenStore            = null; // TcTokenStore — loaded in init()
+    this._inFlightTcTokenIssuance = new Set(); // dedupe concurrent proactive issuePrivacyTokens per JID
+    this._inFlight463Recoveries   = new Set(); // dedupe concurrent 463-triggered token issuances per JID (separate from proactive)
+    // jid → in-flight pre-send issuance promise. A Set would only say that one
+    // is running; concurrent first sends to the same contact have to be able to
+    // wait for the same answer, so the promise itself is what gets shared.
+    this._tcTokenIssuanceWaiters  = new Map();
+    // How long a first send will wait for its token before going out without
+    // one. _sendIq gives up after 15s, which is far too long to hold a message.
+    this._tcTokenPresendTimeoutMs =
+      Number(opts.tcTokenPresendTimeoutMs) >= 0
+        ? Number(opts.tcTokenPresendTimeoutMs) : TC_TOKEN_PRESEND_TIMEOUT_MS;
+    // Last known account restriction, or null until one is fetched or pushed.
+    this._reachoutTimelock        = null;
+    this._reachoutTimelockInFlight = null;
+    // Blue-tick every message as it arrives. Set to false to make read receipts
+    // explicit, sent only by a markRead() call.
+    this.autoRead = opts.autoRead !== false;
+
+    // Every incoming call is refused unless this is turned off. Off does not
+    // mean calls are answered — nothing here can answer one — it means the
+    // refusal is left to the caller, which is the only way to let some calls
+    // ring and reject the rest. See rejectCall().
+    this._autoRejectCalls = opts.autoRejectCalls !== false;
+    // Flipped by setOnline(). Delivery receipts sent while this is false carry
+    // type="inactive", which the sender's app records but does not render.
+    this._sendActiveReceipts = false;
+    // Cached privacy settings. Warmed after connect and refreshed whenever the
+    // server reports a change; markRead reads it.
+    this._privacySettings = null;
+    // The account's AB props, and the hash that turns the next sync into a
+    // delta. Both live for the session: a fresh process asks for the full set,
+    // which is what a fresh install does.
+    this._abProps     = null;
+    this._abPropsHash = null;
+    // Whether to sync AB props on connect. On by default because the app does
+    // it on every login and a client that never does is running on guessed
+    // defaults, but it is one IQ a caller may not want on a short session.
+    this._syncAbPropsOnConnect = opts.syncAbPropsOnConnect !== false;
+    // noticeId → accepted. Absent means this session has not asked, which
+    // isTosAccepted reports as null rather than as "not accepted".
+    this._tosAccepted = new Map();
+    // The record a primary keeps of what it sends and receives, so a companion
+    // it links can be handed the chat history. Off unless asked for, and only
+    // ever opened on a primary (mobile) session — see _openMessageStore.
+    // `true`, or { perChat, maxMessages } to bound what is kept.
+    this._messageStoreOptions = opts.messageStore
+      ? (typeof opts.messageStore === 'object' ? opts.messageStore : {}) : null;
+    this._messageStore    = null;
+    this._messageStoreKey = null;
+    // A close waiting for the decrypt queue to drain, and how long it waits.
+    this._messageStoreClosing = null;
+    this._messageStoreDrainMs = 2000;
+    if (opts.pino !== undefined) _whaConfigLogger(opts.pino);
+  }
+
+  get store()     { return this._store; }
+  get sender()    { return this._sender; }
+  get connected() { return this._connected; }
+
+  // ─── Registration statics ─────────────────────────────────────────────────
+
+  static async register(phoneNumber, opts) {
+    return checkIfRegistered(phoneNumber, opts || {});
+  }
+
+  static async requestCode(phoneNumber, method, opts) {
+    return requestSmsCode(phoneNumber, method || 'sms', opts || {});
+  }
+
+  static async confirmCode(phoneNumber, code, opts) {
+    return verifyCode(phoneNumber, code, opts || {});
+  }
+
+  // ─── Connect ──────────────────────────────────────────────────────────────
+
+  async connect(phoneNumber) {
+    return this.init(phoneNumber);
+  }
+
+  /**
+   * Bring a session's announced version up to date, before every handshake.
+   *
+   * A session records the version it registered with and announces that
+   * forever after. Months later the server stops accepting it and the connect
+   * is refused with a 405 that says nothing about why — and the only remaining
+   * move, before this, was to run `wa refresh-version` by hand or register the
+   * number again. The companion path never had that problem because
+   * connectWeb() reads the live revision every time; this is the same idea for
+   * the primary one.
+   *
+   * Both platforms, and the version each one asks for is the one that platform
+   * publishes: the App Store listing for iOS, the Play Store listing for
+   * Android.
+   *
+   * Android was left out of this at first, on the grounds that its version has
+   * to match the APK the token material came from. That holds for registering a
+   * number and nowhere else. The Android token is an HMAC over the APK's
+   * signing certificates, the digest of its classes.dex and the national
+   * number — the version string is not in it — and no token of any kind travels
+   * in the handshake, which carries the version, the username and the device
+   * properties. So there is nothing here for a refreshed version to fall out of
+   * step with. Registration keeps reading the APK's own version through
+   * fetchWaVersion(), so a number being registered still announces the build
+   * its token was computed from.
+   *
+   * Called from _connectSocket() rather than init(), so it covers the
+   * library's own reconnects too. The handshake reads store.version at the
+   * moment it runs, so a version written here is the one that goes out.
+   *
+   * Three rules keep this from being the thing that breaks a working session:
+   *
+   *   • It never goes backwards. Both lookups answer with a pinned fallback
+   *     rather than failing, and that fallback can easily be older than what a
+   *     session already holds. Moving a session to an older version is the one
+   *     outcome that makes a 405 more likely rather than less.
+   *   • WA_VERSION still wins. Someone who has pinned a version on the way out
+   *     of a 405 must not have it quietly replaced.
+   *   • It never throws, and it never blocks for long. A lookup that fails
+   *     leaves the session exactly as it was and the connect carries on. The
+   *     lookups memoise for six hours, so a connection that flaps every few
+   *     seconds reaches the network once, not once per attempt.
+   */
+  async _refreshAnnouncedVersion() {
+    if (!this._refreshVersion || this._mode === 'web' || !this._store) return;
+    if (process.env.WA_VERSION) {
+      _whaDbg('[DBG] VERSION refresh skipped — WA_VERSION is set');
+      return;
+    }
+
+    const device   = this._store.device || getDeviceConfig();
+    const business = !!device.business;
+    const android  = device.os === 'android';
+    // Named for where the answer comes from, since that is the first thing
+    // anyone reading a version line wants to know. Android is answered by
+    // Play's API now, not by the store page it used to scrape.
+    const source   = android ? 'Play Store' : 'App Store listing';
+
+    try {
+      const { compareVersions, fetchAndroidVersionLive } = require('./Registration');
+      const before = this._store.version;
+      // Connecting and registering ask different questions, and they must not
+      // share an answer.
+      //
+      // Registration announces the build its token was computed from, which is
+      // the APK material and nothing else — see fetchWaVersion().
+      //
+      // Connecting announces the build the store is serving *now*, because a
+      // version the server no longer recognises is what a 405 is. The material
+      // is the wrong source for that: it ages the moment Play moves on, and a
+      // session pinned to it would keep announcing an older build forever
+      // without anything looking broken.
+      //
+      // fetchAndroidVersionLive asks Play's own API first and only falls back
+      // to the store page, which no longer carries a version worth reading.
+      const live   = android
+        ? await fetchAndroidVersionLive(business)
+        : await fetchIosVersion(business);
+      if (!live) return;
+
+      if (before && compareVersions(live, before) <= 0) {
+        _whaDbg('[DBG] VERSION already current (' + before + ', ' + source +
+          ' says ' + live + ')');
+        return;
+      }
+
+      this._store.version = live;
+      this._persistStore();
+      _whaDbg('[DBG] VERSION refreshed ' + (before || 'none') + ' → ' + live +
+        ' (' + source + ')');
+      this.emit('version_update', { from: before || null, to: live, source });
+
+      // On Android the token material carries the version of the APK it was
+      // read from. Once the listing has moved past it, that material is from an
+      // older build — which matters for registering a number, not for this
+      // connection. Say so rather than fetching an APK on the connect path.
+      if (android) this._warnIfApkMaterialStale(device, live);
+    } catch (err) {
+      // A session that cannot ask keeps the version it has.
+      _whaDbg('[DBG] VERSION refresh failed: ' + (err && err.message));
+    }
+  }
+
+  /**
+   * Note that the cached APK material predates the build Play is serving.
+   *
+   * Only registration reads that material, so nothing is broken here and
+   * nothing is downloaded. It is said once per connection so that a number
+   * registered from this install goes out under a current build if the owner
+   * refreshes the material first.
+   */
+  _warnIfApkMaterialStale(device, liveVersion) {
+    try {
+      const { compareVersions, tryLoadAndroidMaterial } = require('./Registration');
+      if (typeof tryLoadAndroidMaterial !== 'function') return;
+
+      const material   = tryLoadAndroidMaterial(device);
+      const apkVersion = material && material.apkVersion;
+      if (!apkVersion) return;
+      if (compareVersions(liveVersion, apkVersion) <= 0) return;
+
+      _whaDbg('[DBG] APK material is from ' + apkVersion + ', the listing serves ' +
+        liveVersion + ' — run `wa apk-material --download` before registering a number');
+      this.emit('apk_material_stale', {
+        materialVersion: apkVersion,
+        liveVersion,
+        hint: 'wa apk-material --download'
+      });
+    } catch (_) {
+      // Advisory only.
+    }
+  }
+
+  async init(phoneNumber) {
+    phoneNumber = String(phoneNumber).replace(/\D/g, '');
+    this._phoneNumber = phoneNumber;
+    // A fresh attempt clears whatever made the last one fatal, and whatever
+    // deliberate disconnect came before it. Only the public entry points reset
+    // these — the reconnect loop must not clear its own guards.
+    this._fatal   = false;
+    this._closing = false;
+
+    this._sessionDir = sessionDirFor(this._baseDir, phoneNumber);
+
+    const sessionFile = path.join(this._sessionDir, `${phoneNumber}.json`);
+    this._store = loadStore(sessionFile);
+    if (!this._store) {
+      // Say what is missing, and say it accurately. The old text pointed at
+      // 'wa registration -R', a flag this CLI has never accepted, so anyone who
+      // followed it got a second error instead of a registered number. A
+      // library has no business teaching CLI syntax either — the caller knows
+      // which interface it is; this only has to name the state.
+      const hasWeb = fs.existsSync(path.join(this._sessionDir, `${phoneNumber}.web.json`));
+      throw new Boom(
+        hasWeb
+          ? `No primary session for ${phoneNumber}, but it is linked as a ` +
+            'companion device — use connectWeb() rather than init().'
+          : `No session for ${phoneNumber} — register the number first, or ` +
+            'link it to an existing account with connectWeb().', { statusCode: 404 }
+      );
+    }
+
+    const signalFile  = path.join(this._sessionDir, `${phoneNumber}.signal.json`);
+    const skFile      = path.join(this._sessionDir, `${phoneNumber}.sk.json`);
+    const tcTokenFile = path.join(this._sessionDir, `${phoneNumber}.tctoken.json`);
+
+    const { TcTokenStore } = require('./messages/TcTokenStore');
+    this._tcTokenStore = new TcTokenStore(tcTokenFile);
+    this._appState = new AppStateStore(
+      path.join(this._sessionDir, `${phoneNumber}.appState.json`));
+
+    this._signal = SignalProtocol.fromStore(this._store, signalFile, skFile);
+    this._devMgr = new DeviceManager(this);
+    this._devMgr.attachSession(this._sessionDir, phoneNumber);
+
+    // Restore LID ↔ phone mappings persisted from previous sessions.
+    // This ensures we can route to LID JIDs even on fresh connections where no
+    // incoming message has yet populated _pnToLid during this session.
+    const persistedLid = this._signal.store.getLidMappings
+      ? this._signal.store.getLidMappings() : {};
+    for (const [phone, lid] of Object.entries(persistedLid)) {
+      this._pnToLid.set(phone, lid);
+      this._lidToPn.set(lid, phone);
+    }
+    _whaDbg('[DBG] LID_RESTORED count=' + Object.keys(persistedLid).length);
+
+    try {
+      await this._connectSocket();
+    } catch (err) {
+      // A session filed under a number WhatsApp does not use fails here and
+      // only here, with a 401 that says nothing about the number. Since we can
+      // ask the server which form it uses, there is no reason to make anyone
+      // find that out by hand.
+      const fixed = await this._tryCorrectPhoneNumber(err);
+      if (!fixed) throw err;
+      return this.init(fixed);
+    }
+    return this;
+  }
+
+  /**
+   * Last resort before reporting a refused login: check whether the session is
+   * simply filed under the wrong form of the number, and re-file it if so.
+   *
+   * Returns the corrected number when it did something, null otherwise. Only
+   * ever runs once per client — a second 401 after a rename is a real one.
+   */
+  async _tryCorrectPhoneNumber(err) {
+    if (this._autoFixNumber === false) return null;
+    if (this._numberFixAttempted) return null;
+    if (!err || !err.loggedOut || String(err.code) !== '401') return null;
+    this._numberFixAttempted = true;
+
+    let probe;
+    try {
+      probe = await this.checkSessionAlive();
+    } catch (_) {
+      return null;
+    }
+    if (!probe || !probe.mismatch || !probe.canonical) return null;
+
+    _whaDbg('[DBG] AUTO_FIX_NUMBER ' + probe.current + ' → ' + probe.canonical);
+
+    // Let go of the session files before moving them. The Signal store writes
+    // on a debounce, so a pending write would recreate the old file moments
+    // after the rename and leave two half-sessions on disk.
+    this._releaseSessionFiles();
+
+    try {
+      await this.adoptCanonicalNumber(probe.canonical);
+    } catch (renameErr) {
+      _whaDbg('[DBG] AUTO_FIX_NUMBER failed: ' + renameErr.message);
+      return null;
+    }
+
+    this.emit('number_corrected', {
+      from: probe.current,
+      to:   probe.canonical,
+      reason: 'WhatsApp files this account under a different form of the number'
+    });
+    return probe.canonical;
+  }
+
+  // Flush and detach whatever is holding the current session's files open, so
+  // they can be renamed without a queued write putting one of them back.
+  _releaseSessionFiles() {
+    for (const store of [this._signal && this._signal.store,
+                         this._signal && this._signal.senderKeyStore]) {
+      if (!store) continue;
+      try {
+        if (typeof store.detach === 'function') store.detach();
+        else {
+          if (typeof store._flushSync === 'function') store._flushSync();
+          if (store._saveTimer) { clearTimeout(store._saveTimer); store._saveTimer = null; }
+          store._filePath = null;
+        }
+      } catch (_) {}
+    }
+    this._signal       = null;
+    this._devMgr       = null;
+    this._tcTokenStore = null;
+  }
+
+  async _connectSocket() {
+    if (this._mode === 'web') return this._connectWebSocket();
+
+    // Before the handshake, which reads the version straight out of the store.
+    //
+    // Here rather than in init() so that the library's own reconnects get it
+    // too: _scheduleReconnect() calls this method directly, and a session that
+    // refreshed only at startup would announce whatever the listing said the
+    // day the process began, however long it then stayed up. The lookups
+    // memoise for six hours, so a flapping connection costs nothing.
+    await this._refreshAnnouncedVersion();
+
+    const socket = new NoiseSocket(this._store);
+    this._socket = socket;
+
+    // Recreate sender with updated socket reference
+    this._sender = new MessageSender(this);
+
+    socket.on('open',  (sn)  => this._onOpen(sn));
+    socket.on('node',  node  => this._onNode(node));
+    socket.on('close', ()    => this._onClose());
+    socket.on('error', err   => this._onSocketError(err));
+
+    // Pass reconnect attempt count into the Noise handshake ClientPayload
+    this._store.connectAttemptCount = this._reconnectTry;
+    await socket.connect();
+    return socket;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // WHATSAPP WEB (companion) MODE
+  //
+  // Same library, same public API, different way in. Instead of registering a
+  // number over SMS as the account's primary device, we link to an account that
+  // already exists — the way the web client and the desktop apps do. Everything
+  // above the connection is unchanged: the Signal layer, the sender, the group
+  // and media code all read the same store fields.
+  //
+  // Two things do differ once connected, and both are handled below:
+  //   · our own JID carries a device index, so we are no longer device 0 and
+  //     the account's phone becomes just another device we encrypt to;
+  //   · the primary ships history over, which a primary device never receives.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Connect as a companion device.
+   *
+   * If the session has never been paired this resolves as soon as the encrypted
+   * channel is up, leaving the caller to call requestPairingCode(). If it has,
+   * it behaves like connect(): resolves once the server sends <success>.
+   *
+   * @param {string} phoneNumber  account phone number, digits only
+   * @param {object} [opts]       { syncFullHistory, browser }
+   */
+  async connectWeb(phoneNumber, opts) {
+    return this.initWeb(phoneNumber, opts);
+  }
+
+  async initWeb(phoneNumber, opts) {
+    opts = opts || {};
+    phoneNumber = String(phoneNumber).replace(/\D/g, '');
+    this._phoneNumber = phoneNumber;
+    this._mode = 'web';
+    // Same as init(): a fresh attempt lifts both guards from the last one.
+    this._fatal   = false;
+    this._closing = false;
+
+    const { createNewWebStore, loadWebStore, saveWebStore, webSessionPath } =
+      require('./WebStore');
+
+    this._sessionDir = sessionDirFor(this._baseDir, phoneNumber, { create: true });
+    this._webSessionFile = webSessionPath(this._sessionDir, phoneNumber);
+    this._store = loadWebStore(this._webSessionFile) || createNewWebStore(phoneNumber);
+
+    if (opts.syncFullHistory !== undefined) this._store.syncFullHistory = !!opts.syncFullHistory;
+    if (opts.browser) this._store.browser = opts.browser;
+    // Emit the QR as a wa.me/settings/linked_devices# link rather than the bare
+    // comma-joined fields. Off by default — the bare form is what WhatsApp Web
+    // itself renders and the most widely scannable.
+    if (opts.qrWrapUrl) this._qrWrapUrl = true;
+    // Asked once the phone has authorised this device and before the link is
+    // confirmed: return false to turn it down.
+    if (opts.prePair !== undefined) {
+      if (opts.prePair !== null && typeof opts.prePair !== 'function') {
+        throw new Boom('connectWeb: prePair must be a function', { statusCode: 400 });
+      }
+      this._prePair = opts.prePair;
+    }
+    if (opts.passkeyAutoConfirm !== undefined) this._passkeyAutoConfirm = !!opts.passkeyAutoConfirm;
+    if (opts.lidDbMigrated !== undefined) this._store.lidDbMigrated = !!opts.lidDbMigrated;
+
+    // Announce the revision the web client is actually on.
+    //
+    // The web endpoint rejects an unrecognised version during the handshake
+    // with <failure reason="405"> and says nothing about why, so a version
+    // pinned in source is a connection that stops working on WhatsApp's
+    // schedule rather than ours. Read the live one, keep the pinned value as
+    // the fallback, and let a caller override both.
+    if (opts.version) {
+      this._store.webVersion = opts.version;
+    } else if (opts.fetchVersion !== false) {
+      const { fetchWaWebVersion } = require('./WebVersion');
+      const res = await fetchWaWebVersion();
+      this._store.webVersion = res.version;
+      _whaDbg('[DBG] WEB_VERSION ' + res.version.join('.') +
+        (res.isLatest ? ' (live)' : ' (pinned fallback: ' +
+          (res.error && res.error.message) + ')'));
+    }
+
+    saveWebStore(this._store, this._webSessionFile);
+
+    // Signal state lives in its own files so a web link and an SMS
+    // registration for the same number never share sessions or pre-keys.
+    const signalFile  = path.join(this._sessionDir, `${phoneNumber}.web.signal.json`);
+    const skFile      = path.join(this._sessionDir, `${phoneNumber}.web.sk.json`);
+    const tcTokenFile = path.join(this._sessionDir, `${phoneNumber}.web.tctoken.json`);
+
+    const { TcTokenStore } = require('./messages/TcTokenStore');
+    this._tcTokenStore = new TcTokenStore(tcTokenFile);
+    this._appState = new AppStateStore(
+      path.join(this._sessionDir, `${phoneNumber}.web.appState.json`));
+
+    this._signal = SignalProtocol.fromStore(this._store, signalFile, skFile);
+    this._devMgr = new DeviceManager(this);
+    this._devMgr.attachSession(this._sessionDir, phoneNumber + '.web');
+
+    const persistedLid = this._signal.store.getLidMappings
+      ? this._signal.store.getLidMappings() : {};
+    for (const [phone, lid] of Object.entries(persistedLid)) {
+      this._pnToLid.set(phone, lid);
+      this._lidToPn.set(lid, phone);
+    }
+
+    if (this._store.me && this._store.me.lid) this._myLid = this._store.me.lid;
+
+    await this._connectWebSocket();
+    return this;
+  }
+
+  _saveWebStore() {
+    if (this._mode !== 'web' || !this._webSessionFile) return;
+    const { saveWebStore } = require('./WebStore');
+    saveWebStore(this._store, this._webSessionFile);
+  }
+
+  // Write the session back to disk, whichever kind it is. A change that only
+  // lives in memory is a change that is gone at the next start.
+  _persistStore() {
+    try {
+      if (this._mode === 'web') { this._saveWebStore(); return; }
+      if (!this._sessionDir || !this._store || !this._store.phoneNumber) return;
+      const { saveStore } = require('./Store');
+      saveStore(this._store, path.join(this._sessionDir, `${this._store.phoneNumber}.json`));
+    } catch (err) {
+      _whaDbg('[DBG] STORE persist failed: ' + (err && err.message));
+    }
+  }
+
+  async _connectWebSocket() {
+    const { encodeCompanionRegisterPayload, encodeCompanionLoginPayload } =
+      require('./webproto');
+
+    const store      = this._store;
+    const registered = !!store.registered && !!(store.me && store.me.id);
+
+    const payloadOpts = {
+      version:         store.webVersion,
+      browser:         store.browser,
+      countryCode:     'US',
+      pushName:        store.name && store.name !== 'User' ? store.name : undefined,
+      syncFullHistory: store.syncFullHistory !== false,
+      lidDbMigrated:   store.lidDbMigrated !== false,
+      registrationId:  store.registrationId,
+      identityKeyPair: store.identityKeyPair,
+      signedPreKey:    store.signedPreKey
+    };
+
+    const socket = new NoiseSocket(store, {
+      transport:     'web',
+      // An unpaired companion never gets <success> on this connection — the
+      // server answers with pair-device and waits for a human to act.
+      expectSuccess: registered,
+      buildPayload:  () => registered
+        ? encodeCompanionLoginPayload(Object.assign({}, payloadOpts, {
+            username: store.phoneNumber,
+            device:   store.deviceIndex || 0
+          }))
+        : encodeCompanionRegisterPayload(payloadOpts)
+    });
+
+    this._socket = socket;
+    this._sender = new MessageSender(this);
+
+    socket.on('open',    (sn) => this._onOpen(sn));
+    socket.on('secured', ()   => {
+      _whaDbg('[DBG] WEB_CHANNEL_SECURED — awaiting pairing');
+      this.emit('web_ready_for_pairing');
+    });
+    socket.on('node',  node => this._onNode(node));
+    socket.on('close', ()   => this._onClose());
+    socket.on('error', err  => this._onSocketError(err));
+
+    await socket.connect();
+    return socket;
+  }
+
+  /**
+   * A socket-level error, which includes the server refusing the handshake.
+   *
+   * The refusal arrives here rather than as a <failure> stanza — it happens
+   * before the stream is open, so _handleFailure never sees it and never set
+   * the flag that stops the reconnect. The result was a client that retried a
+   * rejected login every second, forever, printing the same 401 each time.
+   * Anything the handshake marked as a spent session stops the loop here.
+   */
+  _onSocketError(err) {
+    // The server declined the client, not the session. The next attempt
+    // announces exactly the same thing and is refused exactly the same way, so
+    // this stops here instead of retrying once a second forever. _handleFailure
+    // already reads a 405 this way, but it only runs once a stream is open — a
+    // 405 during the handshake never reached it, which is why a refused client
+    // reconnected in a loop.
+    if (err && String(err.code) === '405') {
+      _whaDbg('[DBG] HANDSHAKE_REJECTED code=405 — client refused, not a dead session');
+      this._fatal       = true;
+      this._reconnecting = false;
+      this.emit('client_rejected', {
+        reason:   '405',
+        location: null,
+        message:  err.message,
+        node:     null
+      });
+      this.emit('error', err);
+      return;
+    }
+
+    if (err && String(err.code) === '402') {
+      const expire = err.banExpireSecs != null ? err.banExpireSecs : null;
+      this.emit('temporary_ban', {
+        code:       err.banCode != null ? err.banCode : null,
+        expireSecs: expire,
+        expiresAt:  expire != null ? Date.now() + expire * 1000 : null
+      });
+    }
+
+    if (err && err.loggedOut) {
+      _whaDbg('[DBG] HANDSHAKE_REJECTED code=' + err.code + ' — not retrying');
+      this._fatal = true;
+      this.emit('auth_failure', {
+        reason: String(err.code || '401'),
+        location: null,
+        loggedOut: true,
+        message: err.message
+      });
+    }
+    this.emit('error', err);
+  }
+
+  /**
+   * Ask WhatsApp for an 8-character pairing code.
+   *
+   * The account owner enters it on their phone under
+   * Settings → Linked Devices → Link a device → Link with phone number instead.
+   * The code is a password, not an identifier: it never travels to the server
+   * in the clear, and both sides run it through PBKDF2 to wrap the ephemeral
+   * keys they exchange.
+   *
+   * Resolves with the code as soon as the request is on the wire. The link
+   * itself completes later — wait for the 'paired' or 'open' event.
+   *
+   * @param {string} [phoneNumber]  defaults to the number initWeb was given
+   * @param {string} [customCode]   exactly 8 characters, if you want to choose
+   * @returns {Promise<string>}
+   */
+  // Primary-role approval of a SEPARATE companion. This keeps the same
+  // authenticated mobile socket and never calls connectWeb on this client.
+  _primaryLinkingForSession() {
+    if (!this._primaryLinking) {
+      const { PrimaryLinking } = require('./PrimaryLinking');
+      this._primaryLinking = new PrimaryLinking(this);
+    }
+    return this._primaryLinking;
+  }
+
+  getPrimaryLinkInvitations() {
+    return this._primaryLinkingForSession().pendingInvitations();
+  }
+
+  async approveCompanionCode(code, options) {
+    return this._primaryLinkingForSession().approve(code, options);
+  }
+
+  async approveCompanionQr(qrOrUrl, options) {
+    return this._primaryLinkingForSession().approveQr(qrOrUrl, options);
+  }
+
+  // Convenience names match the public-fork idea, but keep our verified result
+  // contract. Ambiguous invitations require an explicit invitationId.
+  async linkCompanionWithCode(code, options) {
+    return this._primaryLinkingForSession().approve(code, options, true);
+  }
+
+  async linkCompanionWithQr(qrOrUrl, options) {
+    return this.approveCompanionQr(qrOrUrl, options);
+  }
+
+  async reconcilePrimaryLink(proof, options) {
+    return this._primaryLinkingForSession().reconcile(proof, options);
+  }
+
+  async listLinkedDevices() {
+    return this._primaryLinkingForSession().listLinkedDevices();
+  }
+
+  async getPrimaryLinkStatus() {
+    return this._primaryLinkingForSession().status();
+  }
+
+  async retireAbsentPrimaryLink(options) {
+    return this._primaryLinkingForSession().retireAbsent(options);
+  }
+
+  // Whether this primary can finish a link, found out before one is approved
+  // (see lib/primary/Readiness.js). It sends two read-only IQs, the device list
+  // and a critical_block read with no patch, and reads the local key, app-state
+  // and history files and the message store's snapshot (which sweeps expired
+  // disappearing messages, as taking one for the bootstrap does). On first use
+  // it may create the link journal and its lock, as any primary-link call does.
+  // It never approves, never sends a message or a patch, never makes a key and
+  // never updates link state.
+  // Resolves with { ready, mode, blockers, history, needsConfirmation }.
+  async getPrimaryLinkReadiness(options = {}) {
+    const Readiness = require('./primary/Readiness');
+    return Readiness.evaluateReadiness(await Readiness.gatherFacts(this, options));
+  }
+
+  async bootstrapEmptyPrimaryCompanion(options) {
+    return require('./PrimaryBootstrap').bootstrapEmptyPrimary(this._primaryLinkingForSession(), options);
+  }
+
+  // Key share, critical_block patch and the INITIAL_BOOTSTRAP history for the
+  // companion just linked. history: 'store' sends what this client's primary
+  // message store holds; a history above 64 KiB deflated goes up as an
+  // md-msg-hist blob. resume continues a recorded attempt after its last
+  // accepted step; resendUncertain also resends a step whose ACK never came.
+  async bootstrapPrimaryCompanion(options = {}) {
+    const C = require('./PrimaryLinkCrypto');
+    let history = options.history;
+    if (history === 'store') {
+      C.requireValue(this._messageStore, 'PRIMARY_MESSAGE_STORE_DISABLED');
+      history = () => this._primaryHistorySnapshot();
+    }
+    const upload = options.upload || (buf => this._sender._uploadMedia('md-msg-hist', buf));
+    return require('./PrimaryBootstrap').bootstrapPrimaryCompanion(this._primaryLinkingForSession(), { ...options, history, upload });
+  }
+
+  async seedPrimaryLinkState(state) {
+    return this._primaryLinkingForSession().seedState(state);
+  }
+
+  // The way out of PRIMARY_LINK_STORE_BUSY when the holder cannot be proven
+  // dead from here: a process on another host or in another container, a lock
+  // in the older bare-pid format, or one an operator knows is gone. Breaking it
+  // is the caller's decision. A holder that is in fact still running finds its
+  // lock gone at its next write and stops there (PRIMARY_LINK_STORE_LOST).
+  // Never the lock this process holds itself, through this client or another.
+  //
+  // options.holder, as getPrimaryLinkLockHolder() returned it: break that
+  // holder only. One that took its place since (null: none was held then) is
+  // left alone, PRIMARY_LINK_STORE_BUSY with the holder now.
+  unlockPrimaryLink(options = {}) {
+    const { PrimaryLinkStore } = require('./PrimaryLinkStore');
+    const file = this._primaryLinkLockFile();
+    return PrimaryLinkStore.breakLock(file, options && Object.prototype.hasOwnProperty.call(options, 'holder') ? options.holder : undefined);
+  }
+
+  // Who holds the link journal's lock, read and nothing more: what
+  // unlockPrimaryLink() would break, to be shown before the operator agrees.
+  // { holder } (null when none is held), refused just as unlockPrimaryLink()
+  // refuses.
+  getPrimaryLinkLockHolder() {
+    const { PrimaryLinkStore } = require('./PrimaryLinkStore');
+    return { holder: PrimaryLinkStore.readHolder(this._primaryLinkLockFile()) };
+  }
+
+  _primaryLinkLockFile() {
+    const C = require('./PrimaryLinkCrypto');
+    const { journalFile } = require('./PrimaryLinking');
+    const { PrimaryLinkStore, heldByThisProcess } = require('./PrimaryLinkStore');
+    C.requireValue(this._mode === 'mobile', 'PRIMARY_LINK_PRIMARY_REQUIRED');
+    C.requireValue(this._store && /^\d{8,15}$/.test(this._store.phoneNumber), 'PRIMARY_LINK_ACCOUNT_REQUIRED');
+    const file = journalFile(this);
+    C.requireValue(!this._primaryLinking && !heldByThisProcess(PrimaryLinkStore.readHolder(file)), 'PRIMARY_LINK_BUSY');
+    return file;
+  }
+
+  _closePrimaryLinking() {
+    if (this._primaryLinking) {
+      this._primaryLinking.close();
+      this._primaryLinking = null;
+    }
+  }
+
+  async requestPairingCode(phoneNumber, customCode) {
+    if (this._mode !== 'web') {
+      throw new Boom('requestPairingCode is only available in web mode — call connectWeb() first', { statusCode: 405 });
+    }
+    if (!this._socket || !this._socket.secured) {
+      throw new Boom('Not connected — call connectWeb() before requesting a pairing code', { statusCode: 428 });
+    }
+    if (this._store.registered) {
+      throw new Boom('This session is already linked — no pairing code needed', { statusCode: 409 });
+    }
+
+    const { generatePairingCode, buildWrappedEphemeralPub, generateEphemeralKeyPair } =
+      require('./PairingCode');
+    const { platformTypeFor } = require('./webproto');
+
+    if (customCode != null && String(customCode).length !== 8) {
+      throw new Boom('A custom pairing code must be exactly 8 characters', { statusCode: 400 });
+    }
+
+    const phone = String(phoneNumber || this._phoneNumber || this._store.phoneNumber)
+      .replace(/\D/g, '');
+    if (!phone) throw new Boom('requestPairingCode: a phone number is required', { statusCode: 400 });
+
+    const code = customCode ? String(customCode).toUpperCase() : generatePairingCode();
+
+    // A fresh ephemeral pair per attempt: a code that was requested and never
+    // used must not be able to complete a later exchange.
+    this._store.pairingEphemeralKeyPair = generateEphemeralKeyPair();
+    this._store.pairingCode = code;
+    this._store.pairingRef  = null;
+    this._store.phoneNumber = phone;
+    this._store.me = { id: phone + '@s.whatsapp.net', name: '~', lid: null };
+    this._saveWebStore();
+
+    const browser  = this._store.browser || ['Ubuntu', 'Chrome', '120.0.0.0'];
+    const wrapped  = await buildWrappedEphemeralPub(code, this._store.pairingEphemeralKeyPair.public);
+
+    // The bare 32-byte curve point, not the 33-byte Signal form.
+    //
+    // whalibmob stores every public key with the 0x05 type prefix, and the
+    // Noise handshake strips it on the way out. This node had no such strip, so
+    // the primary would have hashed 33 bytes where it expected 32 and the link
+    // would fail with nothing to point at.
+    const { stripKeyPrefix } = require('./PairingCode');
+    const noisePub = stripKeyPrefix(this._store.noiseKeyPair.public);
+
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'md'
+    }, [
+      new BinaryNode('link_code_companion_reg', {
+        jid:   this._store.me.id,
+        stage: 'companion_hello',
+        should_show_push_notification: 'true'
+      }, [
+        new BinaryNode('link_code_pairing_wrapped_companion_ephemeral_pub', {}, wrapped),
+        new BinaryNode('companion_server_auth_key_pub', {}, noisePub),
+        new BinaryNode('companion_platform_id', {}, Buffer.from(
+          String(platformTypeFor(browser[1])), 'utf8')),
+        new BinaryNode('companion_platform_display', {}, Buffer.from(
+          `${browser[1]} (${browser[0]})`, 'utf8')),
+        new BinaryNode('link_code_pairing_nonce', {}, Buffer.from('0', 'utf8'))
+      ])
+    ]);
+
+    _whaDbg('[DBG] REQUEST_PAIRING_CODE phone=' + phone + ' code=' + code);
+
+    // Wait for the answer before handing the code out. The server validates the
+    // request (the display name, the number, how often it has been asked) and a
+    // refusal used to go unseen: the code was returned and shown, and typing it
+    // into the phone could never work.
+    const response = await this._sendIq(node);
+    const clearPending = () => {
+      this._store.pairingCode = null;
+      this._store.pairingRef  = null;
+      this._saveWebStore();
+    };
+    if (!response) {
+      clearPending();
+      throw pairingCodeError('The server did not answer the pairing code request', 'PAIRING_CODE_NO_RESPONSE');
+    }
+    if (response.attrs && response.attrs.type === 'error') {
+      clearPending();
+      const errNode = findChild(response, 'error');
+      const errCode = errNode && errNode.attrs && errNode.attrs.code != null ? String(errNode.attrs.code) : null;
+      const errText = errNode && errNode.attrs && errNode.attrs.text ? String(errNode.attrs.text) : null;
+      const why = errCode === '400' ? 'the request was not accepted (check the number and the browser name)'
+                : errCode === '429' ? 'too many pairing codes were requested, wait before asking again'
+                : (errText || 'refused');
+      throw pairingCodeError(
+        'The server refused the pairing code request' + (errCode ? ' (' + errCode + ')' : '') + ': ' + why,
+        'PAIRING_CODE_REFUSED', errCode, errText);
+    }
+    const refBuf = getNodeContent(findChild(findChild(response, 'link_code_companion_reg'), 'link_code_pairing_ref'));
+    if (!refBuf || !refBuf.length) {
+      clearPending();
+      throw pairingCodeError('The pairing code response carried no pairing ref', 'PAIRING_CODE_NO_REF');
+    }
+    this._store.pairingRef = refBuf.toString('utf8');
+    this._saveWebStore();
+
+    this.emit('pairing_code', { code, phoneNumber: phone });
+    return code;
+  }
+
+  /**
+   * Stage 3 of the pairing exchange, driven by the server.
+   *
+   * Arrives once the account owner has typed the code into their phone. We
+   * unwrap the primary's ephemeral key with the key derived from that code, do
+   * the two Diffie-Hellmans, and store adv_secret — the key pair-success will
+   * be verified under.
+   */
+  async _handleCompanionFinish(node) {
+    const { buildCompanionFinishBundle } = require('./PairingCode');
+
+    // Same as the reference client does on pair-success: this stanza carries
+    // the server's clock, and the unified_session sent a moment later is
+    // derived from it.
+    this._updateServerTimeOffset(node);
+
+    const reg = findChild(node, 'link_code_companion_reg');
+    if (!reg) return;
+
+    const childBuf = (desc) => {
+      const c = findChild(reg, desc);
+      if (!c) return null;
+      return Buffer.isBuffer(c.content) ? c.content
+           : ArrayBuffer.isView(c.content) ? Buffer.from(c.content)
+           : typeof c.content === 'string' ? Buffer.from(c.content, 'utf8')
+           : null;
+    };
+
+    const ref                = childBuf('link_code_pairing_ref');
+    const primaryIdentityPub = childBuf('primary_identity_pub');
+    const wrappedEphemeral   = childBuf('link_code_pairing_wrapped_primary_ephemeral_pub');
+
+    if (!ref || !primaryIdentityPub || !wrappedEphemeral) {
+      _whaDbg('[DBG] COMPANION_FINISH missing fields — aborting');
+      this.emit('error', new Boom('Pairing failed: incomplete companion_finish from server', { statusCode: 502 }));
+      return;
+    }
+    if (!this._store.pairingCode) {
+      _whaDbg('[DBG] COMPANION_FINISH without a pending pairing code — ignored');
+      return;
+    }
+    // The notification has to be the answer to the code we asked for. One that
+    // names another ref belongs to an earlier request, or to nobody; deriving
+    // adv_secret from it would replace the one the pending code is tied to.
+    if (this._store.pairingRef && ref.toString('utf8') !== this._store.pairingRef) {
+      // Not an error for the caller: the pending code is untouched and still
+      // good, and a stray notification must not be able to stop a program
+      // that has no error listener.
+      _whaDbg('[DBG] COMPANION_FINISH pairing ref mismatch — ignored');
+      return;
+    }
+
+    try {
+      const { advSecretKey, wrappedKeyBundle } = await buildCompanionFinishBundle({
+        pairingCode:                this._store.pairingCode,
+        pairingEphemeralPrivate:    this._store.pairingEphemeralKeyPair.private,
+        primaryEphemeralPubWrapped: wrappedEphemeral,
+        primaryIdentityPub,
+        identityKeyPair:            this._store.identityKeyPair
+      });
+
+      this._store.advSecretKey = advSecretKey;
+      this._saveWebStore();
+      _whaDbg('[DBG] COMPANION_FINISH adv_secret derived');
+
+      // Awaited rather than fired and forgotten, so a server rejection surfaces
+      // as an error here instead of as a silent stall waiting for a
+      // pair-success that is never coming.
+      const finishResult = await this._sendIq(new BinaryNode('iq', {
+        to:    's.whatsapp.net',
+        type:  'set',
+        id:    this._genMsgId(),
+        xmlns: 'md'
+      }, [
+        new BinaryNode('link_code_companion_reg', {
+          jid:   this._store.me.id,
+          stage: 'companion_finish'
+        }, [
+          new BinaryNode('link_code_pairing_wrapped_key_bundle', {}, wrappedKeyBundle),
+          new BinaryNode('companion_identity_public', {},
+            require('./PairingCode').stripKeyPrefix(this._store.identityKeyPair.public)),
+          new BinaryNode('link_code_pairing_ref', {}, ref)
+        ])
+      ]));
+
+      if (finishResult && finishResult.attrs && finishResult.attrs.type === 'error') {
+        const errNode = findChild(finishResult, 'error');
+        const code = errNode && errNode.attrs && errNode.attrs.code;
+        throw new Boom('server rejected companion_finish' + (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+      }
+      _whaDbg('[DBG] COMPANION_FINISH accepted — awaiting pair-success');
+    } catch (err) {
+      _whaDbg('[DBG] COMPANION_FINISH_ERR ' + (err && err.message));
+      this.emit('error', new Boom('Pairing failed: ' + (err && err.message)));
+    }
+  }
+
+  /**
+   * <iq><pair-success> — the primary has authorised us.
+   *
+   * Verify what it sent, counter-sign it, reply, and persist. The server closes
+   * the connection right after with a 515; the reconnect logs in normally and
+   * that is when history starts arriving.
+   */
+  async _handlePairSuccess(node) {
+    // The phone accepted a scan (or a code) — no more QRs to show.
+    this._stopQrRotation();
+    const { configureSuccessfulPairing, buildPairErrorReply, PAIR_ERROR } = require('./CompanionPairing');
+    const msgId = node && node.attrs && node.attrs.id;
+    // Tell the server why, so the phone stops waiting instead of timing out.
+    const refuse = (kind) => {
+      if (!msgId || !this._socket) return;
+      try { this._socket.sendNode(buildPairErrorReply(msgId, kind, BinaryNode)); }
+      catch (e) { _whaDbg('[DBG] PAIR_ERROR reply failed: ' + (e && e.message)); }
+    };
+    let result = null;
+    try {
+      this._updateServerTimeOffset(node);
+      result = configureSuccessfulPairing(node, {
+        advSecretKey:    this._store.advSecretKey,
+        identityKeyPair: this._store.identityKeyPair
+      }, BinaryNode);
+
+      if (typeof this._prePair === 'function') {
+        let allowed;
+        try {
+          allowed = await this._prePair({
+            jid: result.me.id, lid: result.me.lid,
+            platform: result.platform, businessName: result.businessName
+          });
+        } catch (cbErr) {
+          const err = new Boom('pair-success: the prePair callback threw: ' + (cbErr && cbErr.message));
+          err.pairError = PAIR_ERROR.INTERNAL;
+          throw err;
+        }
+        if (allowed === false) {
+          const err = new Boom('pair-success: rejected locally by the prePair callback', { statusCode: 403 });
+          err.code = 'PAIR_REJECTED_LOCALLY';
+          err.pairError = PAIR_ERROR.INTERNAL;
+          throw err;
+        }
+      }
+
+      this._store.me          = result.me;
+      this._store.deviceIndex = result.deviceIndex;
+      this._store.platform    = result.platform;
+      // The same field the mobile path fills from <success>: the signed device
+      // identity that rides on outgoing pkmsg stanzas.
+      this._store.advIdentity = result.accountEnc;
+      this._store.registered  = true;
+      this._store.pairingCode = null;
+      this._store.pairingRef  = null;
+      if (result.me && result.me.name) this._store.name = result.me.name;
+      this._saveWebStore();
+      this._clearPasskeyState();
+
+      if (result.me && result.me.lid) {
+        this._myLid = result.me.lid;
+        const lidUser = String(result.me.lid).split('@')[0].split(':')[0];
+        const pnUser  = String(result.me.id).split('@')[0].split(':')[0];
+        this._lidToPn.set(lidUser, pnUser);
+        this._pnToLid.set(pnUser, lidUser);
+        await this._trustPrimaryIdentity(lidUser, result);
+      }
+
+      this._socket.sendNode(result.reply);
+      this._sendUnifiedSession();
+      _whaDbg('[DBG] PAIR_SUCCESS jid=' + result.me.id + ' lid=' + result.me.lid +
+        ' device=' + result.deviceIndex);
+      this.emit('paired', {
+        jid:         result.me.id,
+        lid:         result.me.lid,
+        deviceIndex: result.deviceIndex,
+        platform:    result.platform
+      });
+    } catch (err) {
+      _whaDbg('[DBG] PAIR_SUCCESS_ERR ' + (err && err.message));
+      refuse(err && err.pairError);
+      this.emit('pair_error', {
+        jid:      result && result.me ? result.me.id : null,
+        lid:      result && result.me ? result.me.lid : null,
+        platform: result ? result.platform : null,
+        err
+      });
+      this.emit('error', err);
+    }
+  }
+
+  // The account signature key in a pair-success is the phone's own identity
+  // key. Recording it as the identity of the account's device 0 means the first
+  // session the phone opens with us is checked against the key that authorised
+  // the link, rather than accepted from whoever answers for that address.
+  //
+  // Not done for a hosted account: the key that signs there is the host's.
+  async _trustPrimaryIdentity(lidUser, result) {
+    try {
+      if (!lidUser || !result || result.hosted) return;
+      const key = result.account && result.account.accountSignatureKey;
+      const store = this._signal && this._signal.store;
+      if (!key || key.length !== 32 || !store || typeof store.saveIdentity !== 'function') return;
+      await store.saveIdentity(lidUser + '.0', Buffer.concat([Buffer.from([0x05]), Buffer.from(key)]));
+    } catch (err) {
+      _whaDbg('[DBG] PRIMARY_IDENTITY save failed: ' + (err && err.message));
+    }
+  }
+
+  /**
+   * <iq><pair-device> — the QR path.
+   *
+   * The server volunteers this to an unpaired companion that has not asked for
+   * a pairing code. It carries a list of one-time refs; each pairs with our
+   * keys to form one QR string. The node has to be acknowledged or the server
+   * keeps resending it.
+   *
+   * The refs are surfaced raw on `pair_device` for anything that wants them,
+   * and turned into ready-to-render QR strings on `qr` — one now, then a fresh
+   * one each time the current ref expires, until the list runs out. Scanning
+   * any of them links the device.
+   */
+  _handlePairDevice(node) {
+    const id = node.attrs && node.attrs.id;
+    if (id) {
+      this._socket.sendNode(new BinaryNode('iq', {
+        to: 's.whatsapp.net', type: 'result', id
+      }, null));
+    }
+    const pairDevice = findChild(node, 'pair-device');
+    const refs = pairDevice && Array.isArray(pairDevice.content)
+      ? pairDevice.content
+          .filter(c => c && c.description === 'ref')
+          .map(c => (Buffer.isBuffer(c.content) ? c.content.toString('utf8') : String(c.content)))
+      : [];
+    this.emit('pair_device', { refs });
+
+    this._startQrRotation(refs);
+  }
+
+  // Turn the server's refs into QR strings and emit them one at a time.
+  //
+  // A ref is single-use and short-lived, so the first is shown at once and each
+  // later one only when the current has aged out — mirroring the phone-facing
+  // client, which shows a QR for ~60s and then rotates. When the refs run out
+  // the account has to reconnect for a fresh set, which is surfaced as
+  // `qr_timeout` rather than left hanging.
+  _startQrRotation(refs) {
+    this._stopQrRotation();
+    if (!Array.isArray(refs) || refs.length === 0) return;
+
+    const { buildQrData } = require('./QrPairing');
+    const crypto = require('crypto');
+
+    // The adv secret rides inside the QR and is what the phone signs the
+    // account proof with; pair-success verifies against it. The pairing-code
+    // path derives its own, but the QR path has none until here, so mint a
+    // random 32 bytes once and keep it for the whole attempt.
+    if (!this._store.advSecretKey) {
+      this._store.advSecretKey = crypto.randomBytes(32).toString('base64');
+      this._saveWebStore();
+    }
+
+    const { WEB_BROWSER } = require('./constants');
+    const noiseB64    = stripKeyPrefix(this._store.noiseKeyPair.public).toString('base64');
+    const identityB64 = stripKeyPrefix(this._store.identityKeyPair.public).toString('base64');
+    const browser     = this._store.browser || WEB_BROWSER;
+    const wrap        = !!this._qrWrapUrl;
+
+    const queue = refs.slice();
+    let first = true;
+    let current = null;
+
+    // The adv secret is read at the moment a QR is built, not once up front:
+    // the server can ask for it to be replaced while the QRs are on screen.
+    const emitQr = (ref, ttlMs) => {
+      const qr = buildQrData(ref, noiseB64, identityB64, this._store.advSecretKey, browser, { wrap });
+      _whaDbg('[DBG] QR emitted (ref …' + ref.slice(-6) + ', ' + queue.length + ' left)');
+      this.emit('qr', { qr, ref, ttlMs, remaining: queue.length });
+    };
+
+    const showNext = () => {
+      const ref = queue.shift();
+      if (!ref) {
+        _whaDbg('[DBG] QR refs exhausted — reconnect for a fresh set');
+        this._stopQrRotation();
+        this.emit('qr_timeout');
+        return;
+      }
+      // 60s for the first, 20s for each after — the reference client's cadence.
+      const ttlMs = first ? 60000 : 20000;
+      first = false;
+      current = { ref, ttlMs, until: Date.now() + ttlMs };
+      emitQr(ref, ttlMs);
+      this._qrTimer = setTimeout(showNext, ttlMs);
+    };
+
+    // The QR on screen again, with the secret as it is now and the time it has
+    // left. Its timer is not touched: the ref expires when it was going to.
+    this._qrRefresh = () => {
+      if (!current || !this._qrTimer) return;
+      emitQr(current.ref, Math.max(0, current.until - Date.now()));
+    };
+
+    showNext();
+  }
+
+  _stopQrRotation() {
+    if (this._qrTimer) { clearTimeout(this._qrTimer); this._qrTimer = null; }
+    this._qrRefresh = null;
+  }
+
+  // Replace the adv secret with a fresh one.
+  //
+  // The secret rides in every QR and authenticates the pair-success that
+  // follows a scan. The server asks for a new one with a companion_reg_refresh
+  // notification; a QR built from the old one would be scanned, accepted by
+  // the phone, and then fail here.
+  _rotateAdvSecret(opts) {
+    if (this._mode !== 'web' || !this._store || this._store.registered) return false;
+    this._store.advSecretKey = crypto.randomBytes(32).toString('base64');
+    this._saveWebStore();
+    _whaDbg('[DBG] ADV_SECRET rotated');
+    if (!(opts && opts.silent) && typeof this._qrRefresh === 'function') this._qrRefresh();
+    return true;
+  }
+
+  // ─── Passkey linking ──────────────────────────────────────────────────────
+  //
+  // See PasskeyPairing.js for the exchange. The server opens it; the caller
+  // supplies the authenticator.
+
+  _clearPasskeyState() {
+    this._passkeyLinking = null;
+    this._passkeyHandoff = null;
+    this._passkeySkipHandoffUx = false;
+  }
+
+  // An <iq xmlns="md"> to the server that has to be answered. No answer and an
+  // error answer both throw; `what` names the step in the message.
+  async _mdIq(type, children, what) {
+    if (!this._socket) throw passkeyError(what + ': not connected', 'PASSKEY_NOT_CONNECTED');
+    const response = await this._sendIq(new BinaryNode('iq', {
+      id: this._genMsgId(), to: 's.whatsapp.net', type, xmlns: 'md'
+    }, children));
+    if (!response) throw passkeyError(what + ': the server did not answer', 'PASSKEY_NO_RESPONSE');
+    if (response.attrs && response.attrs.type === 'error') {
+      const errNode = findChild(response, 'error');
+      const code = errNode && errNode.attrs && errNode.attrs.code != null ? String(errNode.attrs.code) : null;
+      const text = errNode && errNode.attrs && errNode.attrs.text ? String(errNode.attrs.text) : null;
+      const err = passkeyError(what + ': refused by the server' +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), 'PASSKEY_REFUSED');
+      err.serverCode = code;
+      err.serverText = text;
+      throw err;
+    }
+    return response;
+  }
+
+  /**
+   * <notification type="passkey_prologue_request"> — the account can be linked
+   * with a passkey, and the server is asking for an assertion.
+   */
+  async _handlePasskeyRequest(node) {
+    const Passkey = require('./PasskeyPairing');
+    let publicKey;
+    try {
+      try {
+        publicKey = Passkey.parseRequestOptions(getNodeContent(findChild(node, 'passkey_request_options')));
+      } catch (parseErr) {
+        // The push did not carry usable options; they can be asked for.
+        _whaDbg('[DBG] PASSKEY request unreadable (' + parseErr.message + ') — fetching options');
+        const resp = await this._mdIq('get', [new BinaryNode('passkey_request_options', {}, null)],
+          'passkey request options');
+        publicKey = Passkey.parseRequestOptions(getNodeContent(findChild(resp, 'passkey_request_options')));
+      }
+    } catch (err) {
+      _whaDbg('[DBG] PASSKEY request failed: ' + (err && err.message));
+      this.emit('passkey_error', { err, continuation: false });
+      return;
+    }
+    if (this._store.registered) return;
+
+    // Keep a key derived from the secret the QR was showing, then replace the
+    // secret. The first proves to the phone that the passkey answer comes from
+    // the client it was looking at; the second is what pair-success will be
+    // verified under.
+    if (this._store.advSecretKey) {
+      this._passkeyHandoff = {
+        key: Passkey.deriveHandoffKey(Buffer.from(this._store.advSecretKey, 'base64')),
+        at:  Date.now()
+      };
+    }
+    // Not silently: a QR still on screen carries the old secret, and scanning
+    // it would be accepted by the phone and fail here. It is drawn again with
+    // the new one, so the owner can still choose to scan.
+    this._rotateAdvSecret();
+    _whaDbg('[DBG] PASSKEY request received');
+    this.emit('passkey_request', { publicKey });
+  }
+
+  /**
+   * Answer a `passkey_request` with the assertion an authenticator produced.
+   *
+   * `response` is a WebAuthn assertion: `{ id, rawId, type, response: {
+   * clientDataJSON, authenticatorData, signature, userHandle? } }`, with the
+   * binary members as bytes or base64url — what `credential.toJSON()` returns
+   * in a browser. Resolves once the server has taken it; `passkey_confirmation`
+   * follows.
+   */
+  async sendPasskeyResponse(response) {
+    if (this._mode !== 'web') {
+      throw passkeyError('sendPasskeyResponse is only available in web mode — call connectWeb() first', 'PASSKEY_WRONG_MODE');
+    }
+    if (!this._socket || !this._socket.secured) {
+      throw passkeyError('Not connected — call connectWeb() before answering a passkey request', 'PASSKEY_NOT_CONNECTED');
+    }
+    if (this._store.registered) {
+      throw passkeyError('This session is already linked', 'PASSKEY_ALREADY_LINKED');
+    }
+    const Passkey = require('./PasskeyPairing');
+    const { platformTypeFor } = require('./webproto');
+    const { credentialId, json } = Passkey.encodeWebAuthnResponse(response);
+
+    const refResp = await this._mdIq('get', [new BinaryNode('ref', {}, null)], 'passkey companion ref');
+    const refBuf = getNodeContent(findChild(refResp, 'ref'));
+    if (!refBuf || !refBuf.length) {
+      throw passkeyError('passkey companion ref: the answer carried no ref', 'PASSKEY_NO_REF');
+    }
+    const ref = refBuf.toString('utf8');
+    const deviceType = platformTypeFor((this._store.browser || [])[1]);
+    const prologue = Passkey.buildPrologue({ ref, deviceType });
+
+    this._passkeyLinking = {
+      keyPair:        prologue.keyPair,
+      companionNonce: prologue.companionNonce,
+      ref,
+      deviceType,
+      encryptionKey:  null
+    };
+
+    const children = [
+      new BinaryNode('credential_id', {}, credentialId),
+      new BinaryNode('webauthn_assertion', {}, json),
+      new BinaryNode('prologue_payload', {}, prologue.prologuePayload)
+    ];
+    const handoff = this._passkeyHandoff;
+    if (handoff && Date.now() - handoff.at < Passkey.HANDOFF_TTL_MS) {
+      children.push(new BinaryNode('pairing_handoff_proof', {},
+        Passkey.handoffProof(handoff.key, prologue.prologuePayload)));
+      this._passkeySkipHandoffUx = true;
+    } else {
+      this._passkeySkipHandoffUx = false;
+    }
+
+    await this._mdIq('set', [new BinaryNode('passkey_prologue', {}, children)], 'passkey prologue');
+    this._passkeyHandoff = null;
+    _whaDbg('[DBG] PASSKEY prologue accepted');
+  }
+
+  /**
+   * <notification type="crsc_continuation"> — the primary's half of the
+   * exchange. Reveal our nonce, derive the key and the code.
+   */
+  async _handlePasskeyContinuation(node) {
+    const Passkey = require('./PasskeyPairing');
+    try {
+      const cache = this._passkeyLinking;
+      if (!cache) throw passkeyError('passkey continuation without a pending passkey response', 'PASSKEY_NOT_PENDING');
+      const identityBuf = getNodeContent(findChild(node, 'primary_ephemeral_identity'));
+      if (!identityBuf) throw passkeyError('passkey continuation carries no primary identity', 'PASSKEY_BAD_CONTINUATION');
+      const primary = Passkey.decodePrimaryEphemeralIdentity(identityBuf);
+
+      await this._mdIq('set', [new BinaryNode('companion_nonce', {}, cache.companionNonce)],
+        'passkey companion nonce');
+
+      const derived = Passkey.deriveContinuation({
+        ephemeralPrivate: cache.keyPair.private,
+        primaryPublicKey: primary.publicKey,
+        primaryNonce:     primary.nonce,
+        companionNonce:   cache.companionNonce,
+        deviceType:       cache.deviceType,
+        ref:              cache.ref
+      });
+      // The cache can have been dropped while the nonce was on its way.
+      if (this._passkeyLinking !== cache) return;
+      cache.encryptionKey = derived.encryptionKey;
+
+      const skipHandoffUx = !!this._passkeySkipHandoffUx;
+      const auto = skipHandoffUx && this._passkeyAutoConfirm !== false;
+      _whaDbg('[DBG] PASSKEY confirmation ready (skipHandoffUx=' + skipHandoffUx + ')');
+      this.emit('passkey_confirmation', { code: derived.code, skipHandoffUx, autoConfirmed: auto });
+      // The phone already saw this client's QR, so there is nothing for the
+      // owner to compare.
+      if (auto) await this.sendPasskeyConfirmation();
+    } catch (err) {
+      _whaDbg('[DBG] PASSKEY continuation failed: ' + (err && err.message));
+      this.emit('passkey_error', { err, continuation: true });
+    }
+  }
+
+  /**
+   * Finish a passkey link, once the owner has confirmed that the code from
+   * `passkey_confirmation` matches the one on their phone. `paired` follows.
+   */
+  async sendPasskeyConfirmation() {
+    const cache = this._passkeyLinking;
+    if (!cache) throw passkeyError('No passkey link is in progress', 'PASSKEY_NOT_PENDING');
+    if (!cache.encryptionKey) {
+      throw passkeyError('The passkey link has no encryption key yet — wait for passkey_confirmation', 'PASSKEY_NOT_READY');
+    }
+    const Passkey = require('./PasskeyPairing');
+    const request = Passkey.buildEncryptedPairingRequest({
+      encryptionKey:     cache.encryptionKey,
+      noisePublicKey:    this._store.noiseKeyPair.public,
+      identityPublicKey: this._store.identityKeyPair.public,
+      advSecret:         Buffer.from(this._store.advSecretKey, 'base64')
+    });
+    await this._mdIq('set', [new BinaryNode('encrypted_pairing_request', {}, request)],
+      'passkey pairing request');
+    this._passkeyLinking = null;
+    _whaDbg('[DBG] PASSKEY pairing request accepted — awaiting pair-success');
+  }
+
+  /**
+   * The JID this device sends as.
+   *
+   * A primary is device 0 and its JID is the bare number. A companion occupies
+   * a numbered slot, and the account's phone is then a peer we encrypt to like
+   * any other linked device — which is exactly the difference the fan-out code
+   * needs to know about.
+   */
+  _ownDeviceJid() {
+    const phone = String(this._store.phoneNumber);
+    const idx   = (this._mode === 'web' && this._store.deviceIndex) || 0;
+    return idx > 0 ? `${phone}:${idx}@s.whatsapp.net` : `${phone}@s.whatsapp.net`;
+  }
+
+  // <ib><unified_session/> — the telemetry ping a web client emits after
+  // pairing and after each login. It carries no state we need; sending it keeps
+  // our traffic shaped like the client we are claiming to be. Failures are
+  // ignored, as they are in the reference.
+  // Take the server's clock from whatever stanza carries it.
+  //
+  // Mirrors the reference client: read `t` off <success> and off pair-success,
+  // and keep the difference from ours. Anything unparseable or non-positive is
+  // ignored rather than allowed to poison the offset.
+  _updateServerTimeOffset(node) {
+    const t = node && node.attrs && node.attrs.t;
+    if (!t) return;
+    const parsed = Number(t);
+    if (!Number.isFinite(parsed) || parsed <= 0) return;
+    this._serverTimeOffsetMs = parsed * 1000 - Date.now();
+    _whaDbg('[DBG] SERVER_TIME_OFFSET ' + this._serverTimeOffsetMs + 'ms');
+  }
+
+  _sendUnifiedSession() {
+    if (this._mode !== 'web' || !this._socket) return;
+    try {
+      const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+      // Server clock, not ours — see _serverTimeOffsetMs.
+      const now = Date.now() + this._serverTimeOffsetMs;
+      const id = ((now + 3 * 24 * 60 * 60 * 1000) % WEEK_MS).toString();
+      this._socket.sendNode(new BinaryNode('ib', {}, [
+        new BinaryNode('unified_session', { id }, null)
+      ]));
+    } catch (_) {}
+  }
+
+  /** Same, in LID space. */
+  _ownDeviceLidJid() {
+    if (!this._myLid) return null;
+    const lidUser = String(this._myLid).split('@')[0].split(':')[0];
+    const idx = (this._mode === 'web' && this._store.deviceIndex) || 0;
+    return idx > 0 ? `${lidUser}:${idx}@lid` : `${lidUser}@lid`;
+  }
+
+  /**
+   * Close the connection, and keep it closed.
+   *
+   * Connect again through init() / initWeb() — those are where the caller says
+   * it wants a connection, and where the guard below is lifted.
+   *
+   * @param {object}  [opts]
+   * @param {boolean} [opts.reconnect=false]  drop the current socket but leave
+   *        the reconnect loop armed. For a failure the server has told us is
+   *        temporary, where coming back is the right answer.
+   */
+  disconnect(opts) {
+    if (this._primaryLinking) this._closePrimaryLinking();
+    // Closing the socket makes it emit 'close', which lands in _onClose and
+    // schedules a reconnect. That is right for a dropped connection and wrong
+    // for a deliberate teardown — and it is what turned a single <failure> into
+    // an endless retry loop, since clearing _reconnecting was not enough to
+    // stop the handler that sets it again.
+    //
+    // For that to work the guard has to still be set when the 'close' arrives,
+    // and it arrives on a later tick — a socket is destroyed now and reports it
+    // afterwards. Clearing it at the end of this method, which is what it used
+    // to do, meant _scheduleReconnect() never once saw it set: every deliberate
+    // disconnect dialled straight back in a second later, and /reconnect ended
+    // up with the old session live alongside the new one.
+    //
+    // Only ever set here, never cleared, so a teardown that means it cannot be
+    // undone by a later one that does not.
+    if (!(opts && opts.reconnect)) this._closing = true;
+    this._reconnecting = false;
+    this._reconnectTry = 0;
+    this._stopQrRotation();
+    this._clearPasskeyState();
+    this._stopTimers();
+    if (this._socket) {
+      try { this._socket.close(); } catch (_) {}
+      this._socket = null;
+    }
+    // A teardown that is meant releases the message store, once what was
+    // already acked has reached it; one that leaves the reconnect loop armed
+    // keeps it, as _onClose does.
+    if (!(opts && opts.reconnect)) this._closeMessageStoreWhenIdle();
+    this._connected = false;
+    this.emit('close');
+  }
+
+  /**
+   * Ask the sender's phone to upload a media file again.
+   *
+   * Media lives on the CDN for a while, not forever, and the message only ever
+   * carried the URL and the key. A download that comes back 404 or 410 — most
+   * often for something that arrived through history sync long after it was
+   * sent — has nothing left to fetch, and until now that was where it ended:
+   * the message looked fine and the file was simply gone.
+   *
+   * The sender still has the original. This asks for it back.
+   *
+   * The request is encrypted under a key derived from the message's own media
+   * key, so it is proof that we were a recipient rather than merely someone who
+   * knows a message id — no phone can be made to re-upload on request.
+   *
+   * Resolves once the request is on the wire. The answer arrives later as a
+   * `media_retry` event; pass it and the same media key to
+   * decryptMediaRetry() for the fresh path.
+   *
+   *   client.on('media_retry', (n) => {
+   *     const r = client.decryptMediaRetry(n, mediaKey)
+   *     if (r.ok) // re-download from r.directPath
+   *   })
+   *
+   * @param {object} info      { id, chatJid, fromMe, participant }
+   *        `participant` only for a group — the member who sent it.
+   * @param {Buffer} mediaKey  the media key off the original message
+   * @returns {Promise<void>}
+   */
+  async requestMediaRetry(info, mediaKey) {
+    if (!this._socket || !this._connected) {
+      throw new Boom('Not connected — cannot request a media retry', { statusCode: 428 });
+    }
+    if (!info || !info.id)    throw new Boom('requestMediaRetry: info.id is required', { statusCode: 400 });
+    if (!info.chatJid)        throw new Boom('requestMediaRetry: info.chatJid is required', { statusCode: 400 });
+    if (!mediaKey || !mediaKey.length) {
+      throw new Boom('requestMediaRetry: the original message\'s mediaKey is required', { statusCode: 400 });
+    }
+
+    const { buildRetryReceiptNode } = require('./messages/MediaRetry');
+    // Addressed to ourselves: the receipt is a report about a message we hold,
+    // and the server routes it on to the sender.
+    const node = buildRetryReceiptNode(info, mediaKey, this._ownDeviceJid(), BinaryNode);
+    this._socket.sendNode(node);
+    _whaDbg('[DBG] MEDIA_RETRY requested id=' + info.id + ' chat=' + info.chatJid +
+      (info.participant ? ' participant=' + info.participant : ''));
+  }
+
+  /**
+   * Read the answer to requestMediaRetry().
+   *
+   * @param {object} notification  a `media_retry` event payload
+   * @param {Buffer} mediaKey      the same key the request was made with
+   * @returns {{ok: boolean, result: number|null, directPath: string|null}}
+   *          `ok` false means the phone answered but could not oblige — it no
+   *          longer has the file either, and there is nothing further to try.
+   */
+  decryptMediaRetry(notification, mediaKey) {
+    const { decryptRetryNotification } = require('./messages/MediaRetry');
+    if (notification && notification.error) {
+      return { ok: false, result: null, directPath: null, error: notification.error };
+    }
+    return decryptRetryNotification(notification, mediaKey);
+  }
+
+  /**
+   * Ask the server whether this session's registration is still alive.
+   *
+   * The read-only /exist probe, run with the credentials already on disk. It
+   * answers the question a 401 leaves open: whether the number is still
+   * registered and only this device was cut loose, or whether the registration
+   * is gone entirely. Sends nothing to the phone and requests no code, so it
+   * is safe to run on a failure.
+   *
+   * @returns {Promise<{alive: boolean, status: string|null, raw: object|null, error?: string}>}
+   */
+  async checkSessionAlive() {
+    if (!this._store) throw new Boom('No session loaded', { statusCode: 428 });
+    try {
+      const res    = await checkIfRegistered(this._store);
+      const status = (res && (res.status || res.reason)) || null;
+
+      // The server answers with the number in its own canonical form. When that
+      // differs from what the session is filed under, the handshake has been
+      // presenting a username no registration matches — which is a 401 with a
+      // completely different remedy from "register again".
+      //
+      // Brazil is where this bites: mobile numbers gained a ninth digit, and
+      // WhatsApp keeps older accounts under the eight-digit form. Type the
+      // number as it appears on the phone and you get a session whose username
+      // the server has never heard of.
+      const canonical = res && res.login ? String(res.login).replace(/\D/g, '') : null;
+      const current   = String(this._store.phoneNumber || '');
+      const mismatch  = !!(canonical && canonical !== current);
+
+      return {
+        alive: status === 'ok',
+        status,
+        canonical,
+        current,
+        mismatch,
+        raw: res
+      };
+    } catch (err) {
+      return { alive: false, status: null, raw: null, error: err.message };
+    }
+  }
+
+  /**
+   * Re-file this session under the number the server actually knows it by.
+   *
+   * Renames the session and every file that hangs off it, then reloads — bar
+   * the files bound to the old number (PHONE_BOUND_SUFFIXES), which stay under
+   * it. Only touches the primary (SMS) session — a companion link is keyed by the
+   * account, not by the form of the number.
+   *
+   * @param {string} canonical  the digits the server returned as `login`
+   */
+  async adoptCanonicalNumber(canonical) {
+    canonical = String(canonical || '').replace(/\D/g, '');
+    if (!canonical) throw new Boom('adoptCanonicalNumber: no number given', { statusCode: 400 });
+    const current = String(this._store && this._store.phoneNumber || '');
+    if (canonical === current) return { renamed: false, phoneNumber: current };
+
+    const wasConnected = this._connected;
+    if (wasConnected) this.disconnect();
+    // An open store would go on compacting into the old names after the move.
+    this._closeMessageStore();
+
+    // Every per-session file shares the phone number as its stem.
+    // Both layouts: the files are renamed where they sit, and when they sit in
+    // a directory named after the old number that directory is renamed too —
+    // otherwise +<canonical> would live in a folder called +<current> and the
+    // next lookup would not find it.
+    const fromDir = this._sessionDir;
+    const toDir   = isLegacyLayout(this._baseDir, current)
+      ? this._baseDir
+      : path.join(this._baseDir, canonical);
+
+    if (toDir !== fromDir && fs.existsSync(toDir)) {
+      throw new Boom('Cannot rename session: ' + toDir +
+        ' already exists. Move it aside first.', { statusCode: 409 });
+    }
+
+    const moved = [];
+    for (const suffix of SESSION_SUFFIXES) {
+      // Files bound to the old number (the link journal) stay under it: a
+      // rename would leave a file its own binding check refuses to open.
+      if (PHONE_BOUND_SUFFIXES.includes(suffix)) continue;
+      const from = path.join(fromDir, current + suffix);
+      const to   = path.join(fromDir, canonical + suffix);
+      if (!fs.existsSync(from)) continue;
+      if (fs.existsSync(to)) {
+        throw new Boom('Cannot rename session: ' + canonical + suffix +
+          ' already exists. Move it aside first.', { statusCode: 409 });
+      }
+      fs.renameSync(from, to);
+      moved.push(suffix);
+    }
+
+    // The pre-key files carry the number in their names too, one per key.
+    // preKeyFilesFor anchors on the digits, so that is what the new name
+    // replaces — the `.web` half and the id after it are kept as they are.
+    const currentDigits = current.replace(/\D/g, '');
+    for (const name of preKeyFilesFor(fromDir, current)) {
+      const renamed = canonical + name.slice(currentDigits.length);
+      const to      = path.join(fromDir, renamed);
+      if (fs.existsSync(to)) {
+        throw new Boom('Cannot rename session: ' + renamed +
+          ' already exists. Move it aside first.', { statusCode: 409 });
+      }
+      fs.renameSync(path.join(fromDir, name), to);
+      moved.push(renamed);
+    }
+
+    if (!moved.length) throw new Boom('No session files found for ' + current, { statusCode: 404 });
+
+    if (toDir !== fromDir) {
+      fs.renameSync(fromDir, toDir);
+      this._sessionDir = toDir;
+    }
+
+    // The number is inside the store as well as in the filename.
+    const sessionFile = path.join(this._sessionDir, canonical + '.json');
+    const store = loadStore(sessionFile);
+    if (!store) throw new Boom('Session file unreadable after rename');
+    store.phoneNumber = canonical;
+    saveStore(store, sessionFile);
+
+    _whaDbg('[DBG] ADOPT_CANONICAL ' + current + ' → ' + canonical +
+      ' files=' + moved.length);
+
+    this._store = store;
+    this._phoneNumber = canonical;
+    this._fatal = false;
+    return { renamed: true, phoneNumber: canonical, files: moved };
+  }
+
+  // ─── Reconnection ─────────────────────────────────────────────────────────
+
+  _scheduleReconnect() {
+    // A fatal failure — the account logged us out, or the server refused the
+    // client outright — will fail identically every time. Retrying it only
+    // fills the terminal.
+    if (this._closing || this._fatal) return;
+    if (this._reconnecting) return;
+    this._reconnecting = true;
+    const delay = RECONNECT_BACKOFF[Math.min(this._reconnectTry, RECONNECT_BACKOFF.length - 1)];
+    this._reconnectTry++;
+    this.emit('reconnecting', { delay, attempt: this._reconnectTry });
+
+    setTimeout(async () => {
+      if (!this._reconnecting) return;
+      try {
+        await this._connectSocket();
+        this._reconnecting = false;
+        this._reconnectTry = 0;
+        this.emit('reconnected');
+      } catch (err) {
+        this._reconnecting = false;
+        this._scheduleReconnect();
+      }
+    }, delay);
+  }
+
+  // ─── Connection events ────────────────────────────────────────────────────
+
+  _onOpen(successNode) {
+    this._connected = true;
+    this._startTimers();
+
+    // ── Feature 1: Parse <success> node ──────────────────────────────────────
+    // Extract ADVSignedDeviceIdentity, platform, and other account info that
+    // the server provides on each successful authentication.
+    // The server's clock, before anything derived from it is computed.
+    this._updateServerTimeOffset(successNode);
+
+    this._parseSuccessNode(successNode);
+
+    // The successful-login counter (ClientPayload field 24, lc) advances: the
+    // value just announced in the handshake was the pre-login count, and this
+    // login is now accepted. Wraps to 0 past int32 max, as the reference does.
+    //
+    // The primary message store opens on the count before this login, so a
+    // login it was not open for shows up in it as a gap, and is then told of
+    // this one.
+    {
+      this._openMessageStore();
+      const next = (this._store.connectionLc || 0) + 1;
+      this._store.connectionLc = next > 0x7fffffff ? 0 : next;
+      this._persistStore();
+      this._capture('login', s => s.noteLogin(this._store.connectionLc));
+    }
+
+    // ── Feature 3 (part A): Send <active> IQ ─────────────────────────────────
+    // WhatsApp opens sessions as "passive" — the client must explicitly
+    // activate the connection before the server will deliver messages.
+    this._sendActiveIq();
+
+    // ── Feature 3 (part B): Send <presence type="available"> ─────────────────
+    // This presence node is sent immediately after <success>.
+    // Without it, WhatsApp never pushes incoming messages.
+    this.setOnline(true);
+
+    this._requestMediaConnection();
+    // Ask what the server still has rather than uploading blind. It answers
+    // with a number this side has no other way of learning, and then with the
+    // bundle it is serving, which is the thing that goes quietly wrong and
+    // takes the account's reachability with it.
+    this._ensureServerPreKeys('login')
+      .then(() => this._verifyServerKeyBundle('login'))
+      // Both swallow their own failures; this is only here so that a rejection
+      // from somewhere neither expected cannot take the process down with it.
+      .catch(err => _whaDbg('[DBG] PREKEY login check failed: ' + (err && err.message)));
+
+    // Same telemetry ping the web client sends on every completed login.
+    this._sendUnifiedSession();
+
+    // Warm the privacy settings so read receipts respect them from the first
+    // message rather than from whenever something first asks for them.
+    this.queryPrivacySettings({ force: true }).catch(err =>
+      _whaDbg('[DBG] PRIVACY_FETCH_FAILED ' + (err && err.message)));
+
+    // Sync the account's AB props, as the app does on every login. On a
+    // reconnect the stored hash makes this a delta rather than the whole
+    // table. A failure is logged and nothing else: every reader of these has a
+    // default to fall back on, so a client that could not fetch them still
+    // works — it just works on the defaults.
+    if (this._syncAbPropsOnConnect) {
+      this.queryAbProps({ force: true }).catch(err =>
+        _whaDbg('[DBG] AB_PROPS_FETCH_FAILED ' + (err && err.message)));
+    }
+
+    // First login only: check the terms-of-service notice the app checks right
+    // after its first <success>. A fresh account is already accepted
+    // server-side, so this is a quiet confirmation, not a prompt — but a client
+    // that never asks is one more way the session reads as not the app.
+    if (!this._hasConnectedOnce) {
+      this._acceptLoginTos();
+    }
+
+    // ── Reconnect: flush stale device cache + background re-usync ─────────────
+    // On first connect _hasConnectedOnce is false — nothing extra to do.
+    // On every reconnect (network drop / NAT reset / server restart) we flush the
+    // in-memory device cache because contacts may have linked or unlinked devices
+    // while we were offline.  Disk files are kept for next restart warm-read;
+    // in-memory entries are cleared so the next send triggers a fresh usync IQ.
+    if (this._hasConnectedOnce && this._devMgr) {
+      const phonesInCache = Object.keys(this._devMgr._cacheSnapshot || {});
+      _whaDbg('[DBG] RECONNECT: flushing device cache (' + phonesInCache.length + ' entries) for fresh usync');
+      this._devMgr._dcFlush();
+
+      // Immediately re-usync own devices in the background (tablets / linked devices
+      // could have been added or unlinked while we were offline).
+      if (this._store && this._store.phoneNumber && this._signal) {
+        const ownPhone = this._store.phoneNumber;
+        setImmediate(() => {
+          if (!this._connected || !this._devMgr) return;
+          this._devMgr.ensureOwnDeviceSessions(ownPhone, this._signal, false)
+            .then(() => _whaDbg('[DBG] RECONNECT own-device usync done'))
+            .catch(e  => _whaDbg('[DBG] RECONNECT own-device usync err: ' + e.message));
+        });
+      }
+    }
+    this._hasConnectedOnce = true;
+
+    this.emit('connected');
+  }
+
+  // ── Feature 1: Parse the <success> node ────────────────────────────────────
+  //
+  // The <success> node from WhatsApp contains:
+  //   attrs.platform  — server-reported client platform
+  //   attrs.lid       — linked-device ID (for multi-device)
+  //   child <device-identity> — raw ADVSignedDeviceIdentity protobuf bytes
+  //
+  // ADVSignedDeviceIdentity fields (all bytes / wire type 2):
+  //   1: details             — ADVDeviceIdentityDetails proto
+  //   2: accountSignatureKey — 32-byte public key (we strip this when sending)
+  //   3: accountSignature    — 64-byte Ed25519 signature
+  //   4: deviceSignature     — 64-byte Ed25519 signature (empty on primary)
+  //
+  // We persist the bytes so device_identity nodes can be attached to pkmsg
+  // stanzas on every subsequent send — even after a reconnect.
+  _parseSuccessNode(node) {
+    if (!node) return;
+    const attrs = node.attrs || {};
+    // Debug: log the full success node structure
+    _whaDbg('[DBG] SUCCESS node attrs=' + JSON.stringify(attrs));
+
+    // This is an observation of the server's name at authentication time,
+    // not an instruction to discard a newer local rename. In particular it
+    // can still carry the old name on the first login after registration.
+    if (typeof attrs.display_name === 'string' && this._store) {
+      const serverName = String(attrs.display_name);
+      this._store.serverPushName = serverName;
+      const pending = this._store.pendingPushName;
+      if (pending && pending !== serverName) {
+        this._store.name = pending;
+        this._store.pushName = pending;
+        _whaDbg('[DBG] SUCCESS name differs from pending rename; preserving local intent');
+      } else {
+        this._store.name = serverName;
+        this._store.pushName = serverName;
+        this._store.pendingPushName = null;
+      }
+      this._persistStore();
+    } else {
+      _whaDbg('[DBG] SUCCESS carried no display_name — the server did not say what this ' +
+        'account is called');
+    }
+    if (Array.isArray(node.content)) {
+      for (const child of node.content) {
+        if (child && child.description) {
+          _whaDbg('[DBG] SUCCESS child tag=' + child.description + ' attrs=' + JSON.stringify(child.attrs || {}));
+        }
+      }
+    }
+    if (attrs.platform) this._platform = attrs.platform;
+    if (attrs.lid) {
+      this._myLid = String(attrs.lid);
+      // Record our own PN ↔ LID pair alongside every contact's. Prekey bundles
+      // are only ever answered for phone JIDs, so opening a session with one of
+      // our own LID-addressed linked devices needs this mapping just as much as
+      // a contact's does — without it the bundle IQ goes out addressed to @lid
+      // and is never answered.
+      const ownLidUser = this._myLid.split('@')[0].split(':')[0];
+      const ownPnUser  = String(this._store && this._store.phoneNumber || '');
+      if (ownLidUser && ownPnUser) {
+        this._lidToPn.set(ownLidUser, ownPnUser);
+        this._pnToLid.set(ownPnUser, ownLidUser);
+        if (this._signal && this._signal.store && this._signal.store.setLidMapping) {
+          this._signal.store.setLidMapping(ownPnUser, ownLidUser);
+        }
+      }
+    }
+
+    const devIdNode = findChild(node, 'device-identity');
+    if (devIdNode) {
+      const bytes = getNodeContent(devIdNode);
+      if (bytes && bytes.length > 0) {
+        this._store.advIdentity = bytes;
+        // Persist to session file so it survives restart
+        if (this._mode === 'web') {
+          this._saveWebStore();
+        } else {
+          const sessionFile = path.join(
+            this._sessionDir,
+            `${this._store.phoneNumber}.json`
+          );
+          try {
+            const { saveStore } = require('./Store');
+            saveStore(this._store, sessionFile);
+          } catch (_) {}
+        }
+      }
+    } else if (this._store.advIdentity) {
+      // Already have it persisted from a previous session — keep using it
+    }
+
+    // A companion learns its own LID from pair-success, not from <success>, so
+    // keep what pairing established rather than leaving it unset on reconnect.
+    if (this._mode === 'web') {
+      if (!this._myLid && this._store.me && this._store.me.lid) {
+        this._myLid = this._store.me.lid;
+      }
+      if (attrs.lid && this._store.me) {
+        this._store.me.lid = String(attrs.lid);
+        this._saveWebStore();
+      }
+    }
+  }
+
+  // ── Feature 3 (part A): Activate the connection ────────────────────────────
+  //
+  // WhatsApp starts every Noise session in "passive" mode.  The client must
+  // send this IQ to become "active" so the server starts delivering messages.
+  _sendActiveIq() {
+    if (!this._socket) return;
+    const id = this._genMsgId();
+    _whaDbg('[DBG] SEND active IQ id=' + id);
+    this._socket.sendNode(new BinaryNode('iq', {
+      id,
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'passive'
+    }, [new BinaryNode('active', {}, null)]));
+  }
+
+  // ── <ib> dirty-state notifications ────────────────────────────────────────
+  //
+  // After login the server sends <ib><dirty type="account_sync"/></ib> to say
+  // our app state is behind. Each dirty type names what has moved on; the sync
+  // that follows asks for it from the version we last stored.
+  _handleIb(node) {
+    const children = Array.isArray(node.content) ? node.content : [];
+
+    const dirtyTypes = [];
+    for (const child of children) {
+      if (!child || child.description !== 'dirty') continue;
+      const attrs = child.attrs || {};
+      if (!attrs.type) continue;
+      // The announcement carries the moment the change happened, and clearing
+      // the bit means naming that moment back. A <clean> without it does not
+      // acknowledge anything in particular, so the server keeps announcing the
+      // same change on every connection from now on — which is what it did:
+      // the timestamp was on the wire and never read off it. The reference
+      // client's mark-not-dirty takes it as an argument for exactly this reason.
+      dirtyTypes.push({
+        type:      String(attrs.type),
+        timestamp: attrs.timestamp ? String(attrs.timestamp) : null
+      });
+    }
+
+    if (dirtyTypes.length > 0) {
+      this._sendAppStateSyncForTypes(dirtyTypes);
+    }
+
+    // What the server is about to replay from while we were away, and the
+    // moment it has finished. Until offline_sync_completed, what arrives is
+    // backlog rather than live traffic.
+    for (const child of children) {
+      if (!child) continue;
+      const a = child.attrs || {};
+      const num = (v) => (v != null && Number.isFinite(Number(v)) ? Number(v) : 0);
+      if (child.description === 'offline_preview') {
+        this.emit('offline_sync_preview', {
+          total:          num(a.count),
+          appDataChanges: num(a.appdata),
+          messages:       num(a.message),
+          notifications:  num(a.notification),
+          receipts:       num(a.receipt)
+        });
+      } else if (child.description === 'offline') {
+        this.emit('offline_sync_completed', { count: num(a.count) });
+      } else if (child.description === 'downgrade_webclient') {
+        // The QR was scanned by a phone that has multi-device turned off. The
+        // same QR still works once it is turned on.
+        this.emit('qr_scanned_without_multidevice', {});
+      }
+    }
+
+    // After the first login the server asks for a SafetyNet attestation with
+    // <ib><safetynet><integrity nonce='…'/></safetynet></ib>. The client answers
+    // in the same window with <ib><integrity_payload> (and a keystore chain that
+    // needs a real TEE, which a headless client cannot produce). We send the
+    // integrity_payload leg, which is the same AES envelope as the registration
+    // _gi and so is reproducible here.
+    for (const child of children) {
+      if (!child || child.description !== 'safetynet') continue;
+      const integ = Array.isArray(child.content)
+        ? child.content.find(c => c && c.description === 'integrity')
+        : null;
+      const nonce = integ && integ.attrs && integ.attrs.nonce;
+      if (nonce) this._sendIntegrityPayload(String(nonce));
+    }
+
+    this.emit('ib', { node });
+  }
+
+  // Build and send <ib><integrity_payload> in response to the server's SafetyNet
+  // nonce. Opt-in through WA_INTEGRITY_PAYLOAD: the envelope is faithful, but the
+  // native-library hash (_lh) cannot be read on a headless client, so the blob
+  // carries a best-known value and is sent only when asked for. Android only,
+  // and only when the APK material needed to fill the blob is present.
+  _sendIntegrityPayload(nonce) {
+    try {
+      if (!process.env.WA_INTEGRITY_PAYLOAD || !this._socket) return;
+      const device = this._store.device;
+      if (!device || device.os !== 'android') return;
+
+      const Registration = require('./Registration');
+      const attestation  = require('./Attestation');
+      const material = Registration.tryLoadAndroidMaterial(device);
+      if (!material) return;
+
+      const blob = attestation.generateIntegrityPayload({
+        authKeyRaw:  stripKeyPrefix(this._store.noiseKeyPair.public),
+        material,
+        aid:         Registration._verify.deviceAid(this._store),
+        serverNonce: nonce
+      });
+      if (!blob) return;
+
+      this._socket.sendNode(new BinaryNode('ib', {}, [
+        new BinaryNode('integrity_payload', {}, blob)
+      ]));
+      _whaDbg('[DBG] INTEGRITY_PAYLOAD sent (' + blob.length + ' b64 chars)');
+    } catch (err) {
+      _whaDbg('[DBG] INTEGRITY_PAYLOAD failed: ' + (err && err.message));
+    }
+  }
+
+  // ── Feature 3 (part C): Send an app-state-sync IQ ──────────────────────────
+  //
+  // Maps WhatsApp dirty-type names → the actual collection names used in the
+  // sync IQ.  We use return_snapshot=true on the first request (version 0) so
+  // the server sends a full snapshot; subsequent requests use the stored
+  // version and return_snapshot=false (incremental patches only).
+  //
+  // We do NOT decrypt the patches — that requires the full LTHASH machinery.
+  // We DO update our version counters from the server response so that we
+  // never re-request the same snapshot twice.
+  /**
+   * Acknowledge a dirty bit so the server stops announcing it.
+   *
+   * `<ib><dirty type="..." timestamp="..."/></ib>` is the server saying
+   * something changed while we were away, and when. Whatever the client does
+   * about it, the bit has to be cleared or the same announcement arrives on
+   * every connection.
+   *
+   * The timestamp is half of that acknowledgement: it says *which* change is
+   * being cleared. Every `<clean>` this sent went out without one, because the
+   * attribute was never read off the `<dirty>` that carried it — so nothing was
+   * acknowledged in particular and the server kept announcing. The reference
+   * client's mark-not-dirty takes it as an argument for the same reason.
+   *
+   * @param {string} type            the dirty type, e.g. 'groups'
+   * @param {number|string} [fromTs] the timestamp the announcement carried
+   * @returns {boolean} whether the acknowledgement went out
+   */
+  markNotDirty(type, fromTs) {
+    if (!this._socket || !this._connected) return false;
+    const attrs = { type: String(type) };
+    if (fromTs) attrs.timestamp = String(fromTs);
+    _whaDbg('[DBG] CLEAN_DIRTY type=' + type + (fromTs ? ' t=' + fromTs : ''));
+    this._socket.sendNode(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'urn:xmpp:whatsapp:dirty'
+    }, [new BinaryNode('clean', attrs, null)]));
+    return true;
+  }
+
+  /**
+   * Re-read every group we belong to, then acknowledge the dirty bit.
+   *
+   * Best effort on purpose: the bit has to be cleared either way, or the server
+   * announces the same change on every connection from now on.
+   */
+  _refreshGroupsAfterDirty(type, fromTs) {
+    Promise.resolve()
+      .then(() => this.fetchAllGroups())
+      .then(groups => {
+        _whaDbg('[DBG] DIRTY groups — refreshed ' + (groups ? groups.length : 0) + ' group(s)');
+      })
+      .catch(err => {
+        _whaDbg('[DBG] DIRTY groups — refresh failed: ' + (err && err.message));
+      })
+      .then(() => this.markNotDirty(type, fromTs));
+  }
+
+  _sendAppStateSyncForTypes(dirtyTypes) {
+    if (!this._socket || !this._connected) return;
+
+    // "account_sync" means everything; the rest name one collection each.
+    // Anything not in here is a dirty bit that travels by some other route.
+    const COLLECTION_MAP = {
+      account_sync:         COLLECTIONS.slice(),
+      critical_block:       ['critical_block'],
+      critical_unblock_low: ['critical_unblock_low'],
+      regular_low:          ['regular_low'],
+      regular_high:         ['regular_high'],
+      regular:              ['regular']
+    };
+
+    // Each entry is { type, timestamp } — the timestamp is what the
+    // announcement said, and it goes back on the <clean> that acknowledges it.
+    const collections = new Set();
+    for (const { type, timestamp } of dirtyTypes) {
+      const mapped = COLLECTION_MAP[type];
+      if (!mapped) {
+        if (type === 'groups') {
+          // The bit means something about our groups changed while we were
+          // away. Clearing it without looking leaves every cached group sitting
+          // on the membership and settings it had before we disconnected, so
+          // re-read them first and acknowledge after.
+          this._refreshGroupsAfterDirty(type, timestamp);
+          continue;
+        }
+        // Not an app-state collection, but still a dirty bit the server expects
+        // to be cleared. Ignoring it meant the server re-announced it on every
+        // single connection, forever.
+        _whaDbg('[DBG] DIRTY type=' + type + ' — not an app-state collection, clearing the bit');
+        this.markNotDirty(type, timestamp);
+        continue;
+      }
+      for (const c of mapped) collections.add(c);
+    }
+
+    if (collections.size === 0) return;
+
+    // The bit has to be cleared whatever came of the sync. A session that
+    // cannot sync at all — no key has ever been shared with it, which is every
+    // session that registered its own number — would otherwise leave it set
+    // forever and be told about the same change on every single connection.
+    const clearAll = () => {
+      for (const { type, timestamp } of dirtyTypes) {
+        if (COLLECTION_MAP[type]) this.markNotDirty(type, timestamp);
+      }
+    };
+
+    this.syncAppState([...collections])
+      .then(clearAll)
+      .catch(err => {
+        _whaDbg('[DBG] APP_STATE sync failed: ' + (err && err.message));
+        clearAll();
+      });
+  }
+
+  /**
+   * Pull app state down from the server and apply it.
+   *
+   * This is how everything that is not a message reaches a linked device:
+   * which chats are pinned, archived, muted or marked unread, which messages
+   * are starred, what your contacts are called. It is also the only way those
+   * changes travel *back* — see the chat methods further down, which write
+   * patches rather than mutating anything locally.
+   *
+   * A collection is asked for from the version we hold, and the server answers
+   * with the patches since then. From version 0 it sends a snapshot instead:
+   * the whole collection, which is also what we fall back to when the running
+   * hash stops agreeing with the server's.
+   *
+   * @param {string[]} [names]  collections to sync; all of them by default
+   * @param {object}   [opts]   { snapshot: true } to force a full re-read
+   * @returns {Promise<{applied: number, collections: object}>}
+   */
+  async syncAppState(names, opts) {
+    opts = opts || {};
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (!this._appState) throw new Boom('No session — call init() first', { statusCode: 428 });
+
+    const wanted = (names && names.length ? names : COLLECTIONS)
+      .filter(n => COLLECTIONS.includes(n));
+    if (!wanted.length) return { applied: 0, collections: {} };
+
+    const keys = this._appStateKeys();
+    if (!Object.keys(keys).length) {
+      // The keys arrive from the primary device in an encrypted message. Until
+      // one has, there is nothing that can be decrypted and asking would only
+      // throw the patches away.
+      _whaDbg('[DBG] APP_STATE no sync keys yet — skipping');
+      return { applied: 0, collections: {}, waitingForKeys: true };
+    }
+
+    const nodes = wanted.map(name => {
+      const st = this._appState.get(name);
+      const wantSnapshot = !!opts.snapshot || !st.version;
+      // Asking for a snapshot means asking for the collection from nothing, so
+      // there is no version to ask from. The attribute is left off entirely
+      // rather than sent as 0 — that is what the official client puts on the
+      // wire, and a version on a snapshot request is a contradiction.
+      const attrs = { name, return_snapshot: wantSnapshot ? 'true' : 'false' };
+      if (!wantSnapshot) attrs.version = String(st.version);
+      return new BinaryNode('collection', attrs, null);
+    });
+
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'w:sync:app:state'
+    }, [new BinaryNode('sync', {}, nodes)]));
+
+    if (!resp) throw new Boom('syncAppState: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('syncAppState: server rejected the request' +
+        (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    return this._applyAppStateResponse(resp, opts);
+  }
+
+  /**
+   * The sync keys the primary device has shared, keyed by base64 id.
+   *
+   * They are stored under their hex id but every reference on the wire is
+   * base64, so both spellings are returned and a lookup either way works.
+   */
+  _appStateKeys() {
+    if (!this._store || !this._store.phoneNumber) return {};
+    let raw;
+    try { raw = loadAppStateSyncKeys(this._sessionDir, this._store.phoneNumber) || {}; }
+    catch (_) { raw = {}; }
+    const out = {};
+    for (const [hexId, v] of Object.entries(raw)) {
+      out[hexId] = v;
+      try { out[Buffer.from(hexId, 'hex').toString('base64')] = v; } catch (_) {}
+    }
+    return out;
+  }
+
+  /**
+   * Ask the primary device for app-state keys it never shared.
+   *
+   * App-state mutations are encrypted under keys the phone hands out in an
+   * encrypted message of its own. Miss that message — linked while the phone
+   * was off, a session that had to be rebuilt — and every patch signed with
+   * that key is unreadable, and stays unreadable: the key is not re-offered,
+   * and nothing later in the collection can be decoded past it. The request
+   * goes out as a peer message, the same channel a placeholder resend uses, so
+   * the server routes it to your own devices rather than delivering it as a
+   * chat message to yourself.
+   *
+   * Asking twice for the same key inside a day achieves nothing, so each id is
+   * remembered and held down for that long. This is what the reference client
+   * does when it requests app-state keys, and for the same reason.
+   *
+   * @param {string[]} keyIds  base64 (or hex) key ids, as the decoder reports
+   * @returns {Promise<string|null>} the id of the message that carried it
+   */
+  async requestAppStateKeys(keyIds) {
+    if (!Array.isArray(keyIds) || !keyIds.length) return null;
+    if (!this._sender || !this._connected) return null;
+    const me = this._store && this._store.me && this._store.me.id;
+    if (!me) return null;
+
+    this._appStateKeyRequests = this._appStateKeyRequests || new Map();
+    const now  = Date.now();
+    const want = [];
+
+    for (const id of keyIds) {
+      if (!id) continue;
+      // The decoder reports base64; a caller with the stored spelling has hex.
+      // Both name the same bytes, so normalise before deduplicating.
+      let raw;
+      try {
+        raw = /^[0-9a-fA-F]+$/.test(id) && id.length % 2 === 0
+          ? Buffer.from(id, 'hex')
+          : Buffer.from(id, 'base64');
+      } catch (_) { continue; }
+      if (!raw || !raw.length) continue;
+
+      const key  = raw.toString('base64');
+      const last = this._appStateKeyRequests.get(key);
+      if (last && now - last < APP_STATE_KEY_REQUEST_INTERVAL_MS) continue;
+      this._appStateKeyRequests.set(key, now);
+      want.push(raw);
+    }
+    if (!want.length) return null;
+
+    const {
+      encodeMessage, encodeProtocolMessage, encodeAppStateSyncKeyRequest,
+      PROTOCOL_TYPE_APP_STATE_SYNC_KEY_REQUEST
+    } = require('./proto/MessageProto');
+
+    const payload = encodeProtocolMessage({
+      type: PROTOCOL_TYPE_APP_STATE_SYNC_KEY_REQUEST,
+      appStateSyncKeyRequest: encodeAppStateSyncKeyRequest(want)
+    });
+    const msgBuf = encodeMessage('protocol', payload);
+    const msgId  = this._genMsgId();
+
+    _whaDbg('[DBG] APP_STATE_KEY_REQUEST ' +
+      want.map(b => b.toString('hex')).join(', '));
+
+    await this._sender._sendMessage(String(me), msgId, msgBuf, 'text', {
+      _protocol:      true,           // not a reach-out; keeps it off the tcToken gate
+      _noRecord:      true,           // bookkeeping between our devices, not a chat message
+      category:       'peer',
+      pushPriority:   'high_force',
+      additionalNodes: [new BinaryNode('meta', { appdata: 'default' }, null)]
+    });
+    return msgId;
+  }
+
+  async _applyAppStateResponse(resp, opts) {
+    const syncNode = findChild(resp, 'sync');
+    const cols     = (syncNode && Array.isArray(syncNode.content))
+      ? syncNode.content.filter(n => n && n.description === 'collection') : [];
+
+    const keys    = this._appStateKeys();
+    const getKey  = (b64) => keys[b64] || null;
+    const summary = {};
+    let   applied = 0;
+    let   more    = [];
+
+    for (const col of cols) {
+      const name = col.attrs && col.attrs.name;
+      if (!name || !COLLECTIONS.includes(name)) continue;
+
+      const mutations = [];
+      const collect   = (m) => mutations.push(m);
+      let   result    = null;
+      let   snapshotted = false;
+
+      try {
+        const snapNode = findChild(col, 'snapshot');
+        if (snapNode && snapNode.content) {
+          const blob = await this._fetchAppStateBlob(
+            SyncdProto.decodeExternalBlobReference(getNodeContent(snapNode)));
+          const snap = SyncdProto.decodeSnapshot(blob);
+          result = AppStateSync.decodeSnapshot(name, snap, getKey, collect, true);
+          snapshotted = true;
+        } else {
+          const patchesNode = findChild(col, 'patches') || col;
+          const raw = (Array.isArray(patchesNode.content) ? patchesNode.content : [])
+            .filter(n => n && n.description === 'patch' && getNodeContent(n))
+            .map(n => SyncdProto.decodePatch(getNodeContent(n)));
+
+          // A patch too big to inline is moved into a CDN blob and referenced.
+          for (const p of raw) {
+            if (!p.externalMutations) continue;
+            const blob = await this._fetchAppStateBlob(p.externalMutations);
+            p.mutations = p.mutations.concat(SyncdProto.decodeMutations(blob));
+          }
+          if (!raw.length) { summary[name] = { patches: 0, applied: 0 }; continue; }
+          result = AppStateSync.decodePatches(
+            name, raw, this._appState.get(name), getKey, collect, true);
+        }
+      } catch (err) {
+        if (err && err.isMissingKey) {
+          // Nothing in this collection can be read until the primary shares
+          // that key, and it will not offer one unasked — so ask, and leave the
+          // collection where it is so the next sync picks up from here.
+          _whaDbg('[DBG] APP_STATE ' + name + ' waiting for key ' + err.keyId);
+          summary[name] = { waitingForKey: err.keyId };
+          this.emit('app_state_key_missing', { collection: name, keyId: err.keyId });
+          this.requestAppStateKeys([err.keyId]).catch(() => {});
+          continue;
+        }
+        throw err;
+      }
+
+      // Our hash and the server's have parted company. Every patch after the
+      // break would be applied to the wrong base, so throw our copy away and
+      // ask for the whole collection instead — once. If the snapshot itself
+      // does not verify, keep what we could read and say so.
+      if (result.macFailed && !snapshotted && !opts.snapshot) {
+        _whaDbg('[DBG] APP_STATE ' + name + ' hash mismatch — refetching as snapshot');
+        this._appState.reset(name);
+        more.push(name);
+        continue;
+      }
+
+      this._appState.set(name, result.state);
+      applied += this._applyAppStateMutations(name, mutations);
+      summary[name] = {
+        version: result.state.version,
+        applied: mutations.length,
+        skipped: result.skipped || 0,
+        snapshot: snapshotted,
+        macOk: snapshotted ? result.macOk !== false : !result.macFailed
+      };
+
+      if (col.attrs && col.attrs.has_more_patches === 'true') more.push(name);
+    }
+
+    // The server hands a long collection over in pieces and says so with
+    // has_more_patches; a hash that stopped agreeing puts the collection back
+    // here too, once, as a snapshot. Either way there is more to fetch, and
+    // stopping after one more round would leave the collection half-read
+    // without anything saying so. Keep going until the server stops asking —
+    // with a ceiling, because a server that always says "more" would otherwise
+    // spin here forever.
+    if (more.length) {
+      const rounds = (opts._round || 0) + 1;
+      if (rounds > MAX_APP_STATE_ROUNDS) {
+        _whaDbg('[DBG] APP_STATE giving up after ' + rounds + ' rounds: ' + more.join(', '));
+      } else {
+        const again = await this.syncAppState(more,
+          Object.assign({}, opts, { _round: rounds, snapshot: false }));
+        applied += again.applied;
+        Object.assign(summary, again.collections);
+      }
+    }
+
+    this.emit('app_state_sync', { collections: summary, applied });
+    return { applied, collections: summary };
+  }
+
+  /** Fetch and decrypt an app-state blob the server pushed to the CDN. */
+  async _fetchAppStateBlob(ref) {
+    if (!ref || !ref.mediaKey) throw new Boom('app state blob reference is incomplete', { statusCode: 400 });
+    const { downloadMedia, resolveMediaUrl } = require('./MediaService');
+    const url = resolveMediaUrl(null, ref.directPath);
+    if (!url) throw new Boom('app state blob has no directPath', { statusCode: 400 });
+    return downloadMedia(url, ref.mediaKey, 'WhatsApp App State Keys', {
+      web: this._mode === 'web'
+    });
+  }
+
+  /**
+   * Fold decoded mutations into the local view and announce them.
+   *
+   * These are changes made somewhere else — on the phone, or on another linked
+   * device — so they are applied without being echoed back as patches of our
+   * own, which would bounce between devices forever.
+   */
+  _applyAppStateMutations(collection, mutations) {
+    let count = 0;
+    for (const m of mutations) {
+      const what = AppMutations.describeIndex(m.index);
+      if (!what) continue;
+      const removed = m.operation === SyncdProto.REMOVE;
+      const a       = m.action || {};
+      const jid     = what.jid ? makeJid(what.jid) : null;
+
+      switch (what.kind) {
+        case 'pin': {
+          const pinned = !removed && !!(a.pinAction && a.pinAction.pinned);
+          this._getChatState(jid).pinnedAt = pinned ? (a.timestamp ? Math.floor(a.timestamp / 1000) : Math.floor(Date.now() / 1000)) : 0;
+          this.emit('chat_pinned', { jid, pinned, remote: true });
+          break;
+        }
+        case 'archive': {
+          const archived = !removed && !!(a.archiveChatAction && a.archiveChatAction.archived);
+          this._getChatState(jid).archived = archived;
+          this.emit('chat_archived', { jid, archived, remote: true });
+          break;
+        }
+        case 'mute': {
+          const mute    = a.muteAction || {};
+          const muted   = !removed && !!mute.muted;
+          const chat    = this._getChatState(jid);
+          chat.muted       = muted;
+          chat.muteUntilMs = muted ? (Number(mute.muteEndTimestamp) || -1) : 0;
+          this.emit('chat_muted', { jid, muted, until: chat.muteUntilMs, remote: true });
+          break;
+        }
+        case 'markRead': {
+          const read = !removed && !!(a.markChatAsReadAction && a.markChatAsReadAction.read);
+          this._getChatState(jid).markedAsUnread = !read;
+          this.emit('chat_read', { jid, read, remote: true });
+          break;
+        }
+        case 'star': {
+          const starred = !removed && !!(a.starAction && a.starAction.starred);
+          if (!this._starredMessages) this._starredMessages = new Set();
+          const key = jid + ':' + what.msgId;
+          if (starred) this._starredMessages.add(key); else this._starredMessages.delete(key);
+          this.emit('message_starred', {
+            msgId: what.msgId, chatJid: jid, starred, fromMe: what.fromMe, remote: true
+          });
+          break;
+        }
+        case 'contact': {
+          const c = a.contactAction || {};
+          this.emit('contact_update', {
+            jid,
+            name:      c.fullName || c.firstName || null,
+            firstName: c.firstName || null,
+            lid:       c.lidJid || null,
+            username:  c.username || null,
+            removed,
+            remote:    true
+          });
+          break;
+        }
+        case 'pushName': {
+          const name = (a.pushNameSetting && a.pushNameSetting.name) || null;
+          // Both fields, and to disk. Only `pushName` was set here, and it is
+          // the one the store does not carry — so a rename made on another
+          // device took effect until the process restarted, and never reached
+          // the handshake, which announces `name`.
+          // Login may omit display_name indefinitely. Authenticated App State
+          // must still be able to apply a rename made on another device.
+          if (name && this._store) {
+            this._store.name     = name;
+            this._store.pushName = name;
+            this._store.pendingPushName = null;
+            this._persistStore();
+          }
+          this.emit('push_name_update', { name, remote: true });
+          break;
+        }
+        case 'labelEdit': {
+          const l = a.labelEditAction || {};
+          this.emit('label_edit', {
+            labelId: what.labelId, name: l.name || '', color: l.color || 0,
+            deleted: removed || !!l.deleted, remote: true
+          });
+          break;
+        }
+        case 'labelChat':
+          this.emit('label_association', {
+            labelId: what.labelId, jid: what.jid, msgId: null,
+            labeled: !removed && !!(a.labelAssociationAction && a.labelAssociationAction.labeled), remote: true
+          });
+          break;
+        case 'labelMessage':
+          this.emit('label_association', {
+            labelId: what.labelId, jid: what.jid, msgId: what.msgId,
+            labeled: !removed && !!(a.labelAssociationAction && a.labelAssociationAction.labeled), remote: true
+          });
+          break;
+        case 'deleteForMe':
+          this.emit('message_deleted_for_me', {
+            jid, msgId: what.msgId, fromMe: what.fromMe,
+            deleteMedia: !!(a.deleteMessageForMeAction && a.deleteMessageForMeAction.deleteMedia), remote: true
+          });
+          break;
+        case 'statusMute':
+          this.emit('status_muted', {
+            jid, muted: !removed && !!(a.userStatusMuteAction && a.userStatusMuteAction.muted), remote: true
+          });
+          break;
+        case 'unarchiveChats':
+          this.emit('unarchive_chats_setting', {
+            unarchiveChats: !!(a.unarchiveChatsSetting && a.unarchiveChatsSetting.unarchiveChats), remote: true
+          });
+          break;
+        case 'clear':
+        case 'delete':
+          this.emit('chat_removed', { jid, kind: what.kind, remote: true });
+          break;
+        case 'nct_salt_sync': {
+          // The salt the cstoken fallback is derived from. The server
+          // distributes it into app state; a SET carries the bytes, a REMOVE
+          // withdraws it. Kept on the store so it survives a reconnect. Only a
+          // companion ever gets one, which is why cstoken is a companion-only
+          // thing — a primary has no salt on file and sends none, exactly as
+          // the real primary does until it has minted its own.
+          if (removed) {
+            if (this._store) { this._store.nctSalt = null; this._persistStore(); }
+            _whaDbg('[DBG] NCT_SALT cleared');
+          } else {
+            const salt = a.nctSaltSyncAction && a.nctSaltSyncAction.salt;
+            if (salt && salt.length && this._store) {
+              this._store.nctSalt = Buffer.from(salt).toString('base64');
+              this._persistStore();
+              _whaDbg('[DBG] NCT_SALT stored (' + salt.length + ' bytes)');
+              this.emit('nct_salt', { bytes: salt.length });
+            }
+          }
+          break;
+        }
+        default:
+          // Something the server tracks that this library does not model yet.
+          // Reported rather than dropped, so it is visible that it happened.
+          this.emit('app_state_mutation', {
+            collection, index: m.index, action: a, removed, version: m.version
+          });
+          break;
+      }
+      count++;
+    }
+    return count;
+  }
+
+  /**
+   * Whether this session can write app state at all.
+   *
+   * App-state keys travel one way: the primary device shares them with the
+   * companions it has linked. A companion always gets one. A session that
+   * registered over SMS *is* the primary, so unless it has linked a companion
+   * of its own there is no key in existence and nothing to sign a patch with.
+   */
+  canSyncAppState() {
+    return !!this._newestAppStateKey(this._appStateKeys());
+  }
+
+  /**
+   * Write a change into app state when that is possible, and fall back to
+   * whatever the connection can do otherwise.
+   *
+   * Without this, every chat setting would throw on an SMS session — which is
+   * exactly the connection least able to do anything about it, since the key it
+   * is being asked for is one only it could ever create.
+   *
+   * @returns {Promise<boolean>} whether the change was written to app state,
+   *                             and so will reach other devices
+   */
+  async _appStatePatchOrFallback(desc, fallback) {
+    if (this.canSyncAppState()) {
+      await this._sendAppStatePatch(desc);
+      return true;
+    }
+    if (typeof fallback === 'function') await fallback();
+    return false;
+  }
+
+  /**
+   * Write one change into app state, so it reaches the phone and every other
+   * linked device.
+   *
+   * The local view is updated from the same description that goes on the wire,
+   * so what a caller sees immediately is what the other devices will see.
+   */
+  async _sendAppStatePatch(desc) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (!this._appState) throw new Boom('No session — call init() first', { statusCode: 428 });
+
+    const chosen = this._newestAppStateKey(this._appStateKeys());
+    if (!chosen) {
+      throw new Boom('cannot write app state yet: the primary device has not ' +
+        'shared a sync key with this session', { statusCode: 428 });
+    }
+
+    const state = this._appState.get(desc.name);
+    const { patch, state: next } = AppStateSync.buildPatch(
+      desc, chosen.id, chosen.keyData, state);
+
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'w:sync:app:state'
+    }, [
+      new BinaryNode('sync', {}, [
+        new BinaryNode('collection', {
+          name:            desc.name,
+          version:         String(next.version - 1),
+          return_snapshot: 'false'
+        }, [new BinaryNode('patch', {}, patch)])
+      ])
+    ]));
+
+    if (!resp) throw new Boom('app state patch: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      // The server did not take it, so our state must not move on either.
+      throw new Boom('app state patch rejected by server' + (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    this._appState.set(desc.name, next);
+    return next.version;
+  }
+
+  // The most recently shared key, which is the one to sign new patches with.
+  //
+  // Both spellings of every id are in the map, so the hex ones are passed over
+  // — a patch names its key in base64.
+  _newestAppStateKey(keys) {
+    let best = null;
+    for (const [id, v] of Object.entries(keys || {})) {
+      if (!v || !v.keyData) continue;
+      if (/^[0-9a-f]+$/i.test(id)) continue;
+      if (!best || (v.timestamp || 0) > (best.timestamp || 0)) {
+        best = { id, keyData: v.keyData, timestamp: v.timestamp || 0 };
+      }
+    }
+    return best;
+  }
+
+  _onClose() {
+    if (this._primaryLinking) this._closePrimaryLinking();
+    this._connected = false;
+    this._stopTimers();
+    this._socket = null;   // clear dead reference — prevents accidental sends before reconnect
+    // The message store outlives a dropped connection the client will dial
+    // back: messages already acked are still being decrypted in the queue,
+    // and closing under them would turn each into a loss. It closes when
+    // nothing will reconnect, and then only once they are through.
+    if (this._closing || this._fatal) this._closeMessageStoreWhenIdle();
+    this.emit('disconnected');
+
+    // Reject all pending IQs / acks
+    for (const [, resolve] of this._pendingIqs) {
+      resolve(null);
+    }
+    this._pendingIqs.clear();
+
+    for (const [, resolve] of this._pendingAcks) {
+      resolve({ error: 'disconnected' });
+    }
+    this._pendingAcks.clear();
+
+    this._scheduleReconnect();
+  }
+
+  // ─── Timers ───────────────────────────────────────────────────────────────
+
+  _startTimers() {
+    this._pingTimer = setInterval(() => {
+      if (this._sender && this._connected) this._sender.ping();
+    }, PING_INTERVAL_MS);
+
+    this._keepAliveErrors = 0;
+    this._keepAliveLastOk = Date.now();
+    this._keepTimer = setInterval(() => { this._keepAlivePing(); }, KEEPALIVE_INTERVAL);
+
+    // The server is supposed to say when it is running out of one-time keys,
+    // and mostly does. This is for when it does not: a session that stays up
+    // long enough can be drained without a word, and the first sign of it is
+    // that nobody can reach the account any more.
+    this._preKeyTimer = setInterval(() => {
+      if (this._socket && this._connected) this._ensureServerPreKeys('periodic');
+    }, PRE_KEY_CHECK_INTERVAL);
+  }
+
+  // The keepalive ping, with its answer waited for.
+  //
+  // A ping that is only ever sent proves nothing: on a connection that died
+  // without closing, the writes go into a buffer and the client carries on
+  // believing it is online. Each ping now has a deadline. A missed one is
+  // announced as keepalive_timeout, with how many in a row and when the last
+  // answer came; the first answer after that is keepalive_restored. Nothing is
+  // torn down here — the caller decides whether a silent connection is worth
+  // dropping.
+  _keepAlivePing() {
+    if (!this._socket || !this._connected) return;
+    this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'w:p'
+    }, [new BinaryNode('ping', {}, null)]), { timeoutMs: KEEPALIVE_TIMEOUT_MS, rejectOnNoReply: true })
+      .then(() => {
+        const errors = this._keepAliveErrors || 0;
+        this._keepAliveErrors = 0;
+        this._keepAliveLastOk = Date.now();
+        if (errors > 0) {
+          _whaDbg('[DBG] KEEPALIVE restored after ' + errors + ' missed');
+          this.emit('keepalive_restored', { missed: errors });
+        }
+      })
+      .catch((err) => {
+        // A close has its own events; only a deadline is a silent connection.
+        if (!err || err.code !== 'IQ_TIMEOUT' || !this._connected) return;
+        this._keepAliveErrors = (this._keepAliveErrors || 0) + 1;
+        _whaDbg('[DBG] KEEPALIVE timeout #' + this._keepAliveErrors);
+        this.emit('keepalive_timeout', {
+          errorCount:  this._keepAliveErrors,
+          lastSuccess: this._keepAliveLastOk || null
+        });
+      })
+      .catch(() => {});
+  }
+
+  _stopTimers() {
+    if (this._pingTimer)   { clearInterval(this._pingTimer);   this._pingTimer   = null; }
+    if (this._keepTimer)   { clearInterval(this._keepTimer);   this._keepTimer   = null; }
+    if (this._preKeyTimer) { clearInterval(this._preKeyTimer); this._preKeyTimer = null; }
+  }
+
+  // ─── Node dispatch ────────────────────────────────────────────────────────
+
+  // The queue the reconnect backlog drains through. Built on first use so a
+  // session that never goes offline never pays for it.
+  get _offlineQueue() {
+    if (!this.__offlineQueue) {
+      const { makeOfflineNodeProcessor } = require('./OfflineNodeProcessor');
+      this.__offlineQueue = makeOfflineNodeProcessor(new Map([
+        ['message',      (n) => this._handleMessage(n)],
+        ['receipt',      (n) => this._handleReceipt(n)],
+        ['notification', (n) => this._handleNotification(n)],
+        ['call',         (n) => this._handleCall(n)]
+      ]), {
+        isOpen:  () => !!(this._socket && this._connected),
+        onError: (err, ctx) => {
+          _whaDbg('[DBG] OFFLINE_QUEUE_ERR ' + ctx + ': ' + (err && err.message));
+          this.emit('node_error', { tag: ctx, err });
+        }
+      });
+    }
+    return this.__offlineQueue;
+  }
+
+  _onNode(node) {
+    if (!node || !node.description) return;
+    const tag = node.description;
+    // Debug: log every node received
+    _whaDbg('[DBG] _onNode tag=' + tag + ' attrs=' + JSON.stringify(node.attrs || {}));
+    if (tag === 'iq' && node.attrs && node.attrs.type === 'error') {
+      try { _whaDbg('[DBG] IQ_ERROR content=' + JSON.stringify(node.content)); } catch(_) {}
+    }
+
+    // One malformed stanza must not take the connection down with it.
+    //
+    // A throw here propagates out through the socket's frame reader, which
+    // reports it as a socket error — so a single unhandled shape in one
+    // notification looked like the transport failing, and every stanza queued
+    // behind it in the same offline batch was lost. Contain it: log the stanza
+    // that did it, tell the caller, carry on reading.
+    try {
+      // Backlog from the reconnect, not live traffic. The server stamps these
+      // `offline`, and handling a burst of them the way live stanzas are
+      // handled starts every one of them at once — see OfflineNodeProcessor.
+      if (node.attrs && node.attrs.offline &&
+          (tag === 'message' || tag === 'receipt' ||
+           tag === 'notification' || tag === 'call')) {
+        this._offlineQueue.enqueue(tag, node);
+        return;
+      }
+
+      if      (tag === 'iq')           this._handleIq(node);
+      else if (tag === 'message')      this._handleMessage(node);
+      else if (tag === 'receipt')      this._handleReceipt(node);
+      else if (tag === 'ack')          this._handleAck(node);
+      else if (tag === 'notification') this._handleNotification(node);
+      else if (tag === 'presence')     this._handlePresence(node);
+      else if (tag === 'call')         this._handleCall(node);
+      else if (tag === 'ib')           this._handleIb(node);
+      else if (tag === 'success')      this.emit('session_refresh', { node }); // late success (re-auth)
+      else if (tag === 'failure')      this._handleFailure(node);
+      else if (tag === 'stream:error') this._handleStreamError(node);
+      else                             this.emit('node', node);
+    } catch (err) {
+      _whaDbg('[DBG] NODE_HANDLER_ERR tag=' + tag + ' err=' + (err && err.message) +
+        ' attrs=' + JSON.stringify(node.attrs || {}));
+      this.emit('node_error', { tag, node, err });
+    }
+  }
+
+  // A stream error ends the connection; the reconnect in _onClose picks it up.
+  //
+  // 515 is not a failure. The server sends it immediately after a companion
+  // finishes pairing to say "you are linked now, start over as a normal
+  // client" — the next connection carries the login payload instead of the
+  // pairing bundle, and that is the one that receives history.
+  _handleStreamError(node) {
+    const attrs  = (node && node.attrs) || {};
+    const code   = attrs.code ? String(attrs.code) : null;
+
+    if (code === '515') {
+      _whaDbg('[DBG] STREAM_ERROR 515 — restart required after pairing, reconnecting');
+      this.emit('restart_required', { reason: '515' });
+      return;
+    }
+
+    // Most stream errors carry no code at all — the reason is a child element,
+    // and for <conflict> the type attribute on it says which kind. Reading only
+    // the attributes reported every one of these as "code=null reason=unknown",
+    // which is the same message for a session someone else took over and a
+    // session that was deleted.
+    const child       = Array.isArray(node.content) && node.content[0] ? node.content[0] : null;
+    const childTag    = child && child.description ? child.description : null;
+    const conflictType = childTag === 'conflict' && child.attrs
+      ? String(child.attrs.type || '') : null;
+
+    if (conflictType === 'replaced') {
+      // Another client opened a session for this account and the server handed
+      // it over. Reconnecting immediately just takes it back, and the two ends
+      // trade the session until one of them is stopped — so this one stands
+      // down and says why.
+      _whaDbg('[DBG] STREAM_ERROR conflict/replaced — another client took the session');
+      this._fatal = true;
+      this.emit('connection_replaced', {
+        message: 'Another client connected with this number and took over the ' +
+                 'session. Reconnecting would take it back and the two would ' +
+                 'keep displacing each other, so this connection has stopped. ' +
+                 'Close the other client, then connect again.'
+      });
+      this.disconnect();
+      return;
+    }
+
+    if (conflictType === 'device_removed') {
+      // The companion was unlinked from the phone. Same meaning as a 401.
+      _whaDbg('[DBG] STREAM_ERROR conflict/device_removed — unlinked');
+      this._fatal = true;
+      this.emit('auth_failure', {
+        reason: '401', location: null, loggedOut: true, node
+      });
+      this.disconnect();
+      return;
+    }
+
+    const reason = attrs.reason || conflictType || childTag || code || 'unknown';
+    _whaDbg('[DBG] STREAM_ERROR code=' + code + ' child=' + childTag +
+      ' conflict=' + conflictType + ' reason=' + reason);
+    this.emit('stream_error', { reason, code, conflictType, childTag, node });
+  }
+
+  // ─── IQ handling ──────────────────────────────────────────────────────────
+
+  _handleIq(node) {
+    const id    = node.attrs && node.attrs.id;
+    const type  = node.attrs && node.attrs.type;
+    const xmlns = node.attrs && node.attrs.xmlns;
+
+    // Companion pairing — these arrive unsolicited, so they are checked before
+    // the pending-IQ table rather than after it.
+    //
+    // pair-device is matched on type=set; pair-success is matched on any type.
+    // Requiring type=set on pair-success would drop the stanza that completes
+    // the link.
+    if (this._mode === 'web') {
+      if (type === 'set' && findChild(node, 'pair-device')) { this._handlePairDevice(node);  return; }
+      if (findChild(node, 'pair-success')) {
+        this._handlePairSuccess(node).catch(e =>
+          _whaDbg('[DBG] PAIR_SUCCESS handler failed: ' + (e && e.message)));
+        return;
+      }
+    }
+
+    // Resolve pending IQ
+    if (id) {
+      const handler = this._pendingIqs.get(id);
+      if (handler) {
+        this._pendingIqs.delete(id);
+        handler(node);
+        return;
+      }
+    }
+
+    // Media connection result
+    if (type === 'result' && xmlns === 'w:m') {
+      this._onMediaConnectionResult(node);
+    }
+
+    // Pre-key upload ack — could also replenish
+    if (type === 'result' && xmlns === 'encrypt') {
+      this._checkAndReplenishPreKeys();
+    }
+
+    this.emit('iq', { id, type, xmlns, node });
+  }
+
+  // ─── Message handling ─────────────────────────────────────────────────────
+
+  // Put work on one of the incoming queues.
+  //
+  // Never rejects, and never awaited by the caller: the socket reader must keep
+  // reading, and one stanza that fails must not take the ones queued behind it
+  // with it. What the lock buys is order, not delivery of a result.
+  _queueIncoming(mutex, label, fn) {
+    return mutex.runExclusive(fn).catch(err =>
+      _whaDbg('[DBG] ' + label + '_QUEUE_ERR ' + (err && err.message)));
+  }
+
+  async _handleMessage(node) {
+    const attrs = node.attrs || {};
+    const fromRaw = attrs.from  || null;
+    const partRaw = attrs.participant || null;
+    const from  = String(attrs.from  || '');
+    // A channel post is not encrypted: the Message rides in <plaintext>.
+    if (from.endsWith('@newsletter')) {
+      const post = this._parseNewsletterMessages({ content: [node] })[0];
+      this._sendMessageAck(String(attrs.id || ''), fromRaw, null);
+      if (post && post.decoded) {
+        this.emit('message', {
+          id: post.id, from, participant: from, ts: post.ts, decoded: post.decoded, node,
+          fromMe: false, chat: from, newsletter: true, serverId: post.serverId,
+          viewsCount: post.viewsCount, reactionCounts: post.reactionCounts
+        });
+      }
+      return;
+    }
+    const id    = String(attrs.id    || '');
+    const ts    = parseInt(attrs.t || '0', 10);
+    const participant = String(attrs.participant || from);
+    const senderPn  = attrs.sender_pn  ? String(attrs.sender_pn)  : null;
+    const senderLid = attrs.sender_lid ? String(attrs.sender_lid) : null;
+
+    // Learn the LID ↔ phone pairing from whichever side the stanza names.
+    //
+    // Decryption needs it: a message addressed by LID has to be able to find a
+    // session filed under the phone JID, and the other way round. The pairing
+    // is only ever visible on a stanza that carries both names, so every such
+    // stanza is worth reading — sender_pn against a LID `from`, and sender_lid
+    // against a phone one.
+    const fromUser = from.split('@')[0].split(':')[0];
+    let learnedLid = null, learnedPn = null;
+    if (senderPn && from.endsWith('@lid')) {
+      learnedLid = fromUser;
+      learnedPn  = senderPn.split('@')[0].split(':')[0];
+    } else if (senderLid && !from.endsWith('@lid')) {
+      learnedPn  = fromUser;
+      learnedLid = senderLid.split('@')[0].split(':')[0];
+    }
+    if (learnedLid && learnedPn && learnedLid !== learnedPn) {
+      this._lidToPn.set(learnedLid, learnedPn);
+      this._pnToLid.set(learnedPn, learnedLid);
+      // Persist so the mapping survives reconnects / process restarts
+      if (this._signal && this._signal.store && this._signal.store.setLidMapping) {
+        this._signal.store.setLidMapping(learnedPn, learnedLid);
+      }
+    }
+    _whaDbg('[DBG] _handleMessage from=' + from + ' participant=' + participant + ' senderPn=' + senderPn + ' id=' + id);
+    if (Array.isArray(node.content)) {
+      for (const c of node.content) {
+        if (c && c.description) {
+          _whaDbg('[DBG] MSG_CHILD tag=' + c.description + ' attrs=' + JSON.stringify(c.attrs || {}) + ' contentLen=' + (Buffer.isBuffer(c.content) ? c.content.length : (typeof c.content === 'string' ? c.content.length : 0)));
+        }
+      }
+    }
+
+    const isGroup = from.endsWith('@g.us');
+
+    const encNodes = Array.isArray(node.content)
+      ? node.content.filter(c => c && c.description === 'enc')
+      : [];
+
+    const participantsNode = findChild(node, 'participants');
+
+    const skmsgNode = encNodes.find(n => n.attrs && n.attrs.type === 'skmsg');
+
+    let dmEncNode = encNodes.find(n => n.attrs && (n.attrs.type === 'msg' || n.attrs.type === 'pkmsg'));
+
+    if (!dmEncNode && participantsNode && Array.isArray(participantsNode.content)) {
+      for (const toNode of participantsNode.content) {
+        if (!toNode || toNode.description !== 'to') continue;
+        const toJid = toNode.attrs && toNode.attrs.jid;
+        if (!toJid) continue;
+        const toPhone = toJid.split('@')[0].split(':')[0];
+        if (toPhone === this._store.phoneNumber) {
+          const enc = findChild(toNode, 'enc');
+          if (enc) {
+            dmEncNode = enc;
+            break;
+          }
+        }
+      }
+    }
+
+    // The acknowledgement goes out first and stays outside the queue below.
+    // It tells the server the stanza arrived, and it has to be prompt whatever
+    // the decryption goes on to do — holding it behind a queue of other
+    // people's messages is how a client stops looking like it is listening.
+    //
+    // Once acked the server will not send it again, so the primary store is
+    // told it is in flight before that, never after.
+    if (skmsgNode && isGroup) {
+      this._captureInflight(id, from, ts);
+      this._sendMessageAck(id, fromRaw, partRaw);
+      this._sendDeliveryReceipt(id, fromRaw, partRaw);
+      this._queueIncoming(this._messageMutex, 'MSG', async () => {
+        // SKDM must be processed (awaited) before we attempt skmsg decryption,
+        // because the first message from a sender always bundles both together.
+        if (participantsNode) {
+          await this._processSKDMDistribution(from, participant, participantsNode);
+        }
+        await this._decryptGroupMessage({ node, from, participant, fromRaw, partRaw, id, ts, skmsgNode });
+      });
+      return;
+    }
+
+    if (dmEncNode && this._signal) {
+      this._captureInflight(id, from, ts);
+      this._sendMessageAck(id, fromRaw, partRaw);
+      this._sendDeliveryReceipt(id, fromRaw, partRaw);
+      this._queueIncoming(this._messageMutex, 'MSG', () =>
+        this._decryptDMMessage({ node, from, participant, fromRaw, partRaw, senderPn, id, ts, dmEncNode }));
+      return;
+    }
+
+    const bodyNode = findChild(node, 'body');
+    const text = bodyNode ? (
+      Buffer.isBuffer(bodyNode.content)
+        ? bodyNode.content.toString('utf8')
+        : (bodyNode.content || null)
+    ) : null;
+
+    // Nothing here this client can open into a message, so nothing to keep:
+    // the store counts it as one it could not read rather than miss it.
+    this._captureDecryptFailure(id, from);
+    this._sendMessageAck(id, fromRaw, partRaw);
+    this._sendDeliveryReceipt(id, fromRaw, partRaw);
+    this.emit('message', {
+      id, from, participant, ts, text, node,
+      fromMe: false, chat: from
+    });
+    this._sendReadReceipt(id, fromRaw, partRaw);
+  }
+
+  // The other name this contact answers to, with the device kept.
+  //
+  // A Signal address is user plus device, so the device has to survive the
+  // translation — 250139683860650:5@lid and 40752248147:5@s.whatsapp.net are
+  // the same device, 40752248147:0 is a different one.
+  //
+  // Returns null when there is no mapping for this user yet.
+  _counterpartJid(jid) {
+    if (!jid) return null;
+    const str  = String(jid);
+    const user = str.split('@')[0].split(':')[0];
+    if (!user) return null;
+    const colon  = str.split('@')[0].indexOf(':');
+    const device = colon >= 0 ? str.split('@')[0].slice(colon) : '';
+
+    if (str.endsWith('@lid')) {
+      const pn = this._lidToPn && this._lidToPn.get(user);
+      return pn ? pn + device + '@s.whatsapp.net' : null;
+    }
+    const lid = this._pnToLid && this._pnToLid.get(user);
+    return lid ? lid + device + '@lid' : null;
+  }
+
+  // ─── cstoken ────────────────────────────────────────────────────────────────
+  //
+  // The anti-abuse token the genuine client attaches to a message when it has no
+  // trusted-contact token for the recipient. Unlike a tctoken it is not granted
+  // by the server per contact — it is computed locally:
+  //
+  //   cstoken = HMAC-SHA256(nctSalt, recipient LID)
+  //
+  // The salt is account-wide and arrives over app state, so only a companion
+  // ever holds one. A primary (an SMS session) has no salt on file and sends no
+  // cstoken, which is what the real primary does until it has minted its own.
+  //
+  // This mirrors the reference client's cstoken generation line for line: a
+  // regular user, not the PSA account and not a bot; the recipient resolved to
+  // a LID; the HMAC taken over that LID's bare `user@lid` string.
+
+  /** The stored NCT salt as bytes, or null when this session has none. */
+  _nctSalt() {
+    const b64 = this._store && this._store.nctSalt;
+    if (!b64) return null;
+    try { const b = Buffer.from(b64, 'base64'); return b.length ? b : null; }
+    catch (_) { return null; }
+  }
+
+  /**
+   * The recipient's bare LID (`user@lid`), or null when there is no mapping.
+   *
+   * A JID already on the LID server is used as-is; a phone JID is resolved
+   * through the same PN→LID map every send uses. Device and agent parts are
+   * dropped — the token is taken over the non-AD address, as the reference
+   * client does.
+   */
+  _bareLidFor(jid) {
+    if (!jid) return null;
+    const str  = String(jid);
+    const user = str.split('@')[0].split(':')[0];
+    if (!user) return null;
+    if (str.endsWith('@lid')) return user + '@lid';
+    const lid = this._pnToLid && this._pnToLid.get(user);
+    return lid ? lid + '@lid' : null;
+  }
+
+  /**
+   * The cstoken bytes for a recipient, or null when none should be sent.
+   *
+   * Returns null — so no `<cstoken>` is attached — unless a salt is on file,
+   * the recipient is a regular user, and a LID resolves for them. Every one of
+   * those is a reason the genuine client also sends nothing.
+   */
+  _csTokenFor(jid) {
+    const salt = this._nctSalt();
+    if (!salt) return null;
+
+    const { isRegularTcTokenUser } = require('./messages/TcTokenStore');
+    if (!isRegularTcTokenUser(jid)) return null;
+
+    const lidJid = this._bareLidFor(jid);
+    if (!lidJid) return null;
+
+    return crypto.createHmac('sha256', salt).update(lidJid, 'utf8').digest();
+  }
+
+  // Every address this message's session might be filed under, best first.
+  _signalJidCandidates(from, participant, senderPn) {
+    const out = [];
+    const add = (jid) => {
+      if (!jid) return;
+      const str = String(jid);
+      if (str && !out.includes(str)) out.push(str);
+    };
+
+    // Unchanged from before: the phone JID the stanza named, or the sender.
+    add(senderPn || ((participant && participant !== from) ? participant : from));
+    // Then the other name for each of them.
+    add(this._counterpartJid(out[0]));
+    add(participant && participant !== from ? participant : null);
+    add(from);
+    add(this._counterpartJid(participant && participant !== from ? participant : from));
+
+    return out;
+  }
+
+  // Every address a group participant might be filed under.
+  //
+  // Deliberately not _signalJidCandidates: that one starts from the stanza's
+  // `from`, which in a group is the group itself and is not a Signal address at
+  // all. Here the sender is the only subject, under both of the names the same
+  // person answers to.
+  _senderAddressCandidates(senderJid, senderPn) {
+    const out = [];
+    const add = (jid) => {
+      if (!jid) return;
+      const str = String(jid);
+      if (str && !out.includes(str)) out.push(str);
+    };
+    add(senderJid);
+    add(this._counterpartJid(senderJid));
+    add(senderPn);
+    add(this._counterpartJid(senderPn));
+    return out;
+  }
+
+  // The sender key for a group message, under whichever name it was filed.
+  //
+  // A SenderKeyName keeps the user and the device and drops the domain, so the
+  // LID form and the phone form of one person are two different names for one
+  // key. Which of them a message arrives under is the server's choice and it
+  // varies, so a key stored under the name one stanza used is invisible to the
+  // next stanza that names the other. That is the whole of "No session found to
+  // decrypt message" on a group we have only just joined.
+  async _senderKeyDecryptWithCandidates(groupJid, candidates, cipherBuf, id) {
+    let firstErr = null;
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        const plaintext = await this._signal.senderKeyDecrypt(groupJid, candidates[i], cipherBuf);
+        if (i > 0) {
+          _whaDbg('[DBG] GROUP_DECRYPT id=' + id + ' recovered under ' + candidates[i] +
+            ' after ' + candidates[0] + ' held no sender key');
+        }
+        return plaintext;
+      } catch (err) {
+        if (!firstErr) firstErr = err;
+        // Only "we hold nothing under this name" is worth asking another name
+        // about. A record that exists and refuses the message is a different
+        // problem, and the answer to that is a retry receipt, not another
+        // lookup.
+        if (!/no session found|no senderkeyrecord/i.test(String(err && err.message))) break;
+      }
+    }
+    throw firstErr || new Boom('senderKeyDecrypt: no address to try');
+  }
+
+  // Try each address in turn and return the first plaintext.
+  //
+  // A failed attempt leaves nothing behind — libsignal either returns the
+  // plaintext or throws, and it only commits the advanced session on success —
+  // so trying the second address after the first misses is safe. The error
+  // reported on total failure is the first one, which is the one about the
+  // address the message actually named.
+  async _decryptWithCandidates(candidates, encType, cipherBuf, id) {
+    let firstErr = null;
+
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        const plaintext = await this._signal.decrypt(candidates[i], encType, cipherBuf);
+        if (i > 0) {
+          _whaDbg('[DBG] DM_DECRYPT id=' + id + ' recovered under ' + candidates[i] +
+            ' after ' + candidates[0] + ' had no session');
+        }
+        return plaintext;
+      } catch (err) {
+        if (!firstErr) firstErr = err;
+        // Only "this is not where the session lives" is worth asking a
+        // different address about. A session that exists and refuses the
+        // ciphertext is a different problem, and the answer to that is a retry
+        // receipt, not another lookup.
+        //
+        // "Invalid PreKey ID" belongs in the first group, which is not obvious.
+        // A sender keeps sending pkmsg until it hears back, and every one of
+        // them names the same pre-key — so once the first has been opened, that
+        // pre-key is spent. Meeting one under an address that holds no session
+        // is therefore not a mismatched key: it is this address having no
+        // record of the session the pre-key was already spent on, which is
+        // exactly the case for looking under the other name. Without it the
+        // search stopped at the first address and a group we had just joined
+        // stayed unreadable — which is how this was found.
+        if (!/no matching sessions|no session|invalid prekey/i.test(String(err && err.message))) break;
+      }
+    }
+
+    throw firstErr || new Boom('decrypt: no address to try');
+  }
+
+  _decryptDMMessage({ node, from, participant, fromRaw, partRaw, senderPn, id, ts, dmEncNode }) {
+    const encType   = dmEncNode.attrs && dmEncNode.attrs.type;
+    const cipherBuf = Buffer.isBuffer(dmEncNode.content)
+      ? dmEncNode.content
+      : Buffer.from(dmEncNode.content || '');
+
+    // The same contact is reachable under two names — a phone JID and a LID —
+    // and a Signal address keeps only the user and the device, never the
+    // domain. So 250139683860650:5@lid and 40752248147:5@s.whatsapp.net are
+    // two different addresses for one person, and a session filed under either
+    // one is invisible from the other.
+    //
+    // Which name a message arrives under is the server's choice and it varies
+    // between messages from the same device. When the session was built under
+    // the phone JID and the next message comes addressed by LID, the lookup
+    // finds nothing and decryption fails with "No matching sessions found for
+    // message" — while the very next message from the same contact decrypts.
+    //
+    // The stanza's own name is tried first, so nothing that already works
+    // changes. The counterpart follows, from the LID↔phone mapping we keep.
+    const candidates = this._signalJidCandidates(from, participant, senderPn);
+    const sigJid     = candidates[0];
+
+    _whaDbg('[DBG] DM_DECRYPT id=' + id + ' type=' + encType + ' sigJid=' + sigJid +
+      (candidates.length > 1 ? ' alts=' + candidates.slice(1).join(',') : '') +
+      ' cipherLen=' + cipherBuf.length);
+
+    // Returned, not discarded: _handleMessage runs this behind the message
+    // queue, and the queue can only hold the next message back for as long as
+    // it can see this one is still running.
+    //
+    // `opened` keeps a failure after decryption — a listener that throws, say
+    // — from being counted in the primary store as a message it could not read.
+    let opened = false;
+    return this._decryptWithCandidates(candidates, encType, cipherBuf, id)
+      .then(async plaintext => {
+        opened = true;
+        this._resolveRetry(id);
+        const decoded = this._decodeMsg(plaintext);
+        _whaDbg('[DBG] DM_DECODED id=' + id + ' type=' + decoded.type + ' ptLen=' + (plaintext ? plaintext.length : 0) + ' hasSKDM=' + !!(decoded.skdm || decoded.type === 'senderKeyDistribution'));
+        // Before any of the returns below: every message that arrived is
+        // either stored or no longer in flight.
+        this._captureIncoming({ node, id, from, participant, ts, senderPn, decoded, plaintext });
+
+        // Process embedded SKDM when bundled with a real message (WhatsApp MD always does this
+        // on the first message of a new session, even for 1-on-1 DMs).
+        // axolotlBytes may be absent in newer WA proto versions — that's OK for DM pkmsg flow.
+        if (decoded.skdm && decoded.skdm.axolotlBytes && decoded.skdm.axolotlBytes[0] === 0x33) {
+          try {
+            await this._signal.processSKDM(decoded.skdm.groupId, sigJid, decoded.skdm.axolotlBytes);
+            _whaDbg('[DBG] SKDM_PROCESSED groupId=' + decoded.skdm.groupId + ' sender=' + sigJid);
+          } catch (e) {
+            _whaDbg('[DBG] SKDM_ERR ' + e.message);
+          }
+        }
+
+        // SKDM-only message (no real content) — ACK and move on
+        if (decoded.type === 'senderKeyDistribution') {
+          if (decoded.axolotlBytes && decoded.axolotlBytes[0] === 0x33) {
+            try {
+              await this._signal.processSKDM(decoded.groupId, sigJid, decoded.axolotlBytes);
+              _whaDbg('[DBG] SKDM_ONLY_PROCESSED groupId=' + decoded.groupId + ' sender=' + sigJid);
+            } catch (e) {
+              _whaDbg('[DBG] SKDM_ONLY_ERR ' + e.message);
+            }
+          }
+          this._sendReadReceipt(id, fromRaw, partRaw);
+          return;
+        }
+
+        // Protocol messages — handle history sync and app-state key share before dropping
+        if (decoded.type === 'protocol') {
+          _whaDbg('[DBG] PROTO subtype=' + decoded.subtype + ' id=' + id);
+
+          // Keyed off what the message actually carried rather than off the
+          // type that announced it. A payload that is present is the payload,
+          // whatever the type number turns out to mean.
+          if (decoded.historySyncNotification) {
+            this._handleHistorySync(decoded.historySyncNotification, id);
+          }
+          if (decoded.appStateSyncKeyShare) {
+            this._handleAppStateSyncKeyShare(decoded.appStateSyncKeyShare);
+          }
+
+          return;
+        }
+
+        // If we had asked the phone to resend this one, it has answered.
+        this._resolvePlaceholderResend(id);
+
+        // A DeviceSentMessage is one we sent ourselves from another device. The
+        // stanza's `from` is our own JID, so it says who but never where: the
+        // chat is named inside the envelope and nowhere else. Both are put on
+        // the event — `chat` is the conversation whichever direction the message
+        // went, so a handler can answer without having to know which case it is
+        // looking at.
+        const dsm  = decoded && decoded.deviceSentMeta;
+        const dest = dsm && dsm.destinationJid ? String(dsm.destinationJid) : null;
+        this.emit('message', {
+          id, from, participant, ts, decoded, node,
+          fromMe: !!dest,
+          chat:   dest || from
+        });
+
+        // Nothing is read by receiving our own message back. A read receipt for
+        // it would be addressed to ourselves and marks the chat read on every
+        // other device — which is not what happened.
+        if (!dest) this._sendReadReceipt(id, fromRaw, partRaw);
+
+        // ── pkmsg = peer opened a new Signal session (identity/device change) ──
+        // Re-issue our tcToken to them so the fresh session carries a valid
+        // token.
+        if (encType === 'pkmsg' && this._tcTokenStore) {
+          this._reissueTcTokenAfterIdentityChange(sigJid);
+        }
+      })
+      .catch(err => {
+        _whaDbg('[DBG] DM_ERR id=' + id + ' err=' + (err && err.message));
+        if (!opened) this._captureDecryptFailure(id, from);
+        this.emit('decrypt_error', { id, from, participant, err });
+        this._sendRetryRequest(id, node);
+      });
+  }
+
+  _decryptGroupMessage({ node, from, participant, fromRaw, partRaw, id, ts, skmsgNode }) {
+    const cipherBuf = Buffer.isBuffer(skmsgNode.content)
+      ? skmsgNode.content
+      : Buffer.from(skmsgNode.content || '');
+
+    const senderCandidates = this._senderAddressCandidates(participant);
+    _whaDbg('[DBG] GROUP_DECRYPT id=' + id + ' group=' + from + ' sender=' + participant +
+      (senderCandidates.length > 1 ? ' alts=' + senderCandidates.slice(1).join(',') : '') +
+      ' cipherLen=' + cipherBuf.length);
+
+    // Returned for the same reason as the direct-message path above, and
+    // `opened` is there for the same reason too.
+    let opened = false;
+    return this._senderKeyDecryptWithCandidates(from, senderCandidates, cipherBuf, id)
+      .then(plaintext => {
+        opened = true;
+        this._resolveRetry(id);
+        const decoded = this._decodeMsg(plaintext);
+        this._captureIncoming({ node, id, from, participant, ts, senderPn: null, decoded, plaintext });
+        if (decoded.type === 'senderKeyDistribution') return;
+        if (decoded.type === 'protocol') {
+          if (decoded.historySyncNotification) {
+            this._handleHistorySync(decoded.historySyncNotification, id);
+          }
+          if (decoded.appStateSyncKeyShare) {
+            this._handleAppStateSyncKeyShare(decoded.appStateSyncKeyShare);
+          }
+          return;
+        }
+        this.emit('message', {
+          id, from, participant, ts, decoded, isGroup: true, node,
+          fromMe: false, chat: from
+        });
+        this._sendReadReceipt(id, fromRaw, partRaw);
+      })
+      .catch(err => {
+        _whaDbg('[DBG] GROUP_ERR id=' + id + ' from=' + from +
+          ' participant=' + participant + ' err=' + (err && err.message));
+        if (!opened) this._captureDecryptFailure(id, from);
+        this.emit('decrypt_error', { id, from, participant, err });
+        // Ask the sender to re-send with a fresh SenderKey distribution.
+        // Without this a group we joined after the sender distributed its key
+        // — or any group whose SKDM we missed — stays permanently
+        // undecryptable, failing every message with "No session found to
+        // decrypt message".  The DM path already does this; groups need it
+        // just as much, and the retry must be addressed to the participant
+        // that actually encrypted the message, not to the group JID.
+        this._sendRetryRequest(id, node);
+      });
+  }
+
+  _decodeMsg(buf) {
+    try {
+      const { decodeMessageContainer } = require('./proto/MessageProto');
+      return decodeMessageContainer(buf);
+    } catch (_) {
+      return { type: 'unknown' };
+    }
+  }
+
+  // Process SKDM messages in participants node.
+  // Returns a Promise that resolves when all SKDM decryption+storage is done.
+  // Must be awaited before attempting skmsg decryption so the SenderKey state
+  // is available when the group cipher runs.
+  async _processSKDMDistribution(groupJid, senderJid, participantsNode) {
+    if (!Array.isArray(participantsNode.content)) return;
+    const ownPhone   = String(this._store.phoneNumber);
+    const ownLidUser = this._myLid ? this._myLid.split('@')[0].split(':')[0] : null;
+
+    const tasks = [];
+
+    for (const toNode of participantsNode.content) {
+      if (!toNode || toNode.description !== 'to') continue;
+      const toJid = toNode.attrs && toNode.attrs.jid;
+      if (!toJid) continue;
+      const toUser = String(toJid).split('@')[0].split(':')[0];
+      const isForUs = (toUser === ownPhone) || (ownLidUser && toUser === ownLidUser);
+      if (!isForUs) continue;
+
+      const enc = findChild(toNode, 'enc');
+      if (!enc) continue;
+
+      const encType   = enc.attrs && enc.attrs.type;
+      const cipherBuf = Buffer.isBuffer(enc.content) ? enc.content : Buffer.from(enc.content || '');
+
+      // The sender key rides inside a 1-to-1 message, so opening it needs the
+      // session with that participant — and the session may be filed under the
+      // other name they answer to. Addressing only the name this stanza used is
+      // how joining a group ended with every message failing: the distribution
+      // could not be opened, so no sender key was ever stored, so every skmsg
+      // after it had nothing to decrypt with.
+      const senderCandidates = this._senderAddressCandidates(senderJid);
+
+      tasks.push(
+        this._decryptWithCandidates(senderCandidates, encType, cipherBuf, 'skdm')
+          .then(async decrypted => {
+            const decoded = this._decodeMsg(decrypted);
+            // Filed under the name this stanza used, which is the name the
+            // group message that follows will look it up under.
+            if (decoded && decoded.type === 'senderKeyDistribution' &&
+                decoded.groupId && decoded.axolotlBytes) {
+              await this._signal.processSKDM(decoded.groupId, senderJid, decoded.axolotlBytes);
+              _whaDbg('[DBG] SKDM_DIST_STORED group=' + decoded.groupId + ' sender=' + senderJid);
+            } else if (decoded && decoded.skdm &&
+                       decoded.skdm.groupId && decoded.skdm.axolotlBytes) {
+              await this._signal.processSKDM(decoded.skdm.groupId, senderJid, decoded.skdm.axolotlBytes);
+              _whaDbg('[DBG] SKDM_DIST_STORED group=' + decoded.skdm.groupId + ' sender=' + senderJid);
+            } else {
+              _whaDbg('[DBG] SKDM_DIST_NONE sender=' + senderJid +
+                ' — the <to> entry for us carried no distribution');
+            }
+          })
+          // Said out loud rather than swallowed. This failing is the reason the
+          // group messages that follow cannot be read, and it used to leave no
+          // trace at all — only the downstream failures were visible, which
+          // pointed at the wrong thing.
+          .catch(err => {
+            _whaDbg('[DBG] SKDM_DIST_ERR sender=' + senderJid +
+              ' tried=[' + senderCandidates.join(',') + ']' +
+              ' err=' + (err && err.message));
+            this.emit('skdm_error', { group: groupJid, sender: senderJid, err });
+          })
+      );
+    }
+
+    await Promise.all(tasks);
+  }
+
+  // ─── Primary message capture ──────────────────────────────────────────────
+  //
+  // As the account's primary device this client is the phone, and a companion
+  // it links expects the phone's chat history. With { messageStore } on, what
+  // it sends and receives is written to a PrimaryMessageStore as it happens
+  // (lib/primary/MessageStore.js). The store decides what a record is and what
+  // an edit or a revoke may touch; these only tell it what arrived or went
+  // out, in which chat, and from whom.
+  //
+  // None of it may get in the way of messaging. Every hook runs whole inside
+  // _capture: it does nothing while the store is off or could not be opened,
+  // and whatever it throws — the store, or working out the chat — is said on
+  // 'primary_message_store_error' while the message carries on.
+
+  // Opened at each login, from _onOpen: the point init() and the reconnect
+  // loop share once the session is accepted. Mobile sessions only — a
+  // companion is handed history, it does not keep one to hand out.
+  _openMessageStore() {
+    try {
+      if (!this._messageStoreOptions || this._mode !== 'mobile' || !this._store) return;
+      const phone = String(this._store.phoneNumber || '');
+      const key   = path.join(this._sessionDir, phone);
+      // Logged in again before a pending close ran: that close is off.
+      this._messageStoreClosing = null;
+      if (this._messageStore && this._messageStoreKey === key) return;
+      this._closeMessageStore();
+      const { PrimaryMessageStore } = require('./primary/MessageStore');
+      // setAsideCorrupt: a store that cannot be read is renamed aside and a
+      // new one started, capturing from now (see PrimaryMessageStore.open).
+      const { perChat, maxMessages, setAsideCorrupt } = this._messageStoreOptions;
+      this._messageStore = PrimaryMessageStore.open({
+        dir: this._sessionDir, phone, lc: this._store.connectionLc || 0, perChat, maxMessages, setAsideCorrupt
+      });
+      this._messageStoreKey = key;
+      const aside = this._messageStore.setAside;
+      if (aside) _whaDbg('[DBG] PRIMARY_STORE set aside: ' + aside.join(', '));
+    } catch (err) {
+      // A damaged log, a second holder in this process, a disk that refuses:
+      // messaging goes on without the store, and says that it does.
+      this._messageStore    = null;
+      this._messageStoreKey = null;
+      this._captureFailed('open', err);
+    }
+  }
+
+  _closeMessageStore() {
+    const store = this._messageStore;
+    this._messageStore        = null;
+    this._messageStoreKey     = null;
+    this._messageStoreClosing = null;
+    if (!store) return;
+    try { store.close(); } catch (err) { this._captureFailed('close', err); }
+  }
+
+  // When the client stops: closed once the messages already acked have been
+  // through the store — they are decrypted behind _messageMutex, and closing
+  // under them would make each a loss — or after _messageStoreDrainMs, so a
+  // decrypt that never finishes cannot hold it open. A login in the meantime
+  // keeps the store (_openMessageStore).
+  _closeMessageStoreWhenIdle() {
+    const store = this._messageStore;
+    if (!store || this._messageStoreClosing) return;
+    if (!this._messageMutex.isLocked()) { this._closeMessageStore(); return; }
+    const pending = this._messageStoreClosing = {};
+    let timer = null;
+    const close = () => {
+      clearTimeout(timer);
+      if (this._messageStoreClosing !== pending) return;
+      this._messageStoreClosing = null;
+      if (this._messageStore === store && !this._connected) this._closeMessageStore();
+    };
+    timer = setTimeout(close, this._messageStoreDrainMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    this._messageMutex.waitForUnlock().then(close, close);
+  }
+
+  _captureFailed(op, err) {
+    const code = err && typeof err.code === 'string' && err.code.startsWith('PRIMARY_MESSAGE_STORE_')
+      ? err.code : 'PRIMARY_MESSAGE_STORE_FAILED';
+    _whaDbg('[DBG] PRIMARY_STORE ' + op + ' failed: ' + (err && err.message));
+    // Not even a listener that throws reaches the message this was about.
+    try { this.emit('primary_message_store_error', { code, op, err }); }
+    catch (listenerErr) { _whaDbg('[DBG] PRIMARY_STORE error listener threw: ' + (listenerErr && listenerErr.message)); }
+  }
+
+  // The one way into the store. `fn` runs whole inside it, handed the store,
+  // and nothing it throws gets out.
+  //
+  // A store that closed itself — its lock was broken by an operator
+  // elsewhere (PRIMARY_MESSAGE_STORE_LOST) — is let go here too, so it is said
+  // once rather than as CLOSED for every message after, and the next login
+  // opens the store again, or says who holds it now.
+  _capture(op, fn) {
+    const store = this._messageStore;
+    if (!store) return;
+    try { fn(store); } catch (err) {
+      const code = err && err.code;
+      if ((code === 'PRIMARY_MESSAGE_STORE_LOST' || code === 'PRIMARY_MESSAGE_STORE_CLOSED') && this._messageStore === store) {
+        this._messageStore    = null;
+        this._messageStoreKey = null;
+      }
+      this._captureFailed(op, err);
+    }
+  }
+
+  // The chat a message belongs to, or null for one that is not kept.
+  //
+  // A group, or anything else that is not a person, keeps the jid it was
+  // addressed by. A person is kept under their phone-number jid when the lid
+  // they were addressed by maps to one — one of `alts`, the other names the
+  // stanza itself gave, first, then the pairing this client keeps — and under
+  // the jid as addressed otherwise. With `tie`, the store is told when both
+  // names are known, so an edit or a revoke that arrives under either one
+  // still finds the chat: on the phone-number chat, and on the lid's own
+  // chat too when one was started before the pairing was known.
+  _captureChat(jid, alts, tie) {
+    const addressed = captureJid(jid);
+    if (!capturedChat(addressed)) return null;
+    const isLid = addressed.endsWith('@lid');
+    if (!isLid && !addressed.endsWith('@s.whatsapp.net')) return addressed;
+    const want  = isLid ? '@s.whatsapp.net' : '@lid';
+    const other = [...(alts || []), this._counterpartJid(addressed)]
+      .map(captureJid).find(j => j && j.endsWith(want)) || null;
+    const pnJid  = isLid ? other : addressed;
+    const lidJid = isLid ? addressed : other;
+    const chat   = pnJid || lidJid;
+    if (tie && pnJid && lidJid) {
+      this._capture('meta', store => {
+        store.setChatMeta(chat, { pnJid, lidJid });
+        if (store.hasChat(lidJid)) store.setChatMeta(lidJid, { pnJid, lidJid });
+      });
+    }
+    return chat;
+  }
+
+  // Seen, not yet stored. Written before the ack (see _handleMessage), so a
+  // crash between the ack and the store leaves the message counted as lost
+  // rather than forgotten.
+  _captureInflight(id, from, ts) {
+    this._capture('inflight', store => {
+      const chat = captureJid(from);
+      if (id && capturedChat(chat)) store.recordInflight({ id, chat, ts: captureTs(ts) });
+    });
+  }
+
+  // A message this client could not open. The store keeps the id as a loss
+  // until a retry delivers it after all.
+  _captureDecryptFailure(id, from) {
+    this._capture('decrypt-failure', store => {
+      if (id && capturedChat(captureJid(from))) store.recordDecryptFailure({ id });
+    });
+  }
+
+  // A message that decrypted, whatever it turned out to be: kept, applied to
+  // the message it acts on, or only taken out of flight.
+  //
+  // The chat is the one it arrived in, never one a protocol message names
+  // inside itself — the store scopes revokes and edits to it. A message one
+  // of our other devices sent arrives as a DeviceSentMessage: ours, kept as
+  // the message inside it, in the chat the envelope names — or, when it names
+  // none, the one the stanza does: a group stanza is the group, and one in a
+  // 1:1 chat from our own device names it as `recipient`.
+  _captureIncoming({ node, id, from, participant, ts, senderPn, decoded, plaintext }) {
+    this._capture('incoming', store => {
+      const attrs   = (node && node.attrs) || {};
+      const arrived = captureJid(from);
+      if (!id || !capturedChat(arrived)) return;   // never put in flight either
+      const seen  = captureView(decoded, plaintext);
+      const dsm   = seen && seen.deviceSentMeta;
+      const group = arrived.endsWith('@g.us');
+      const at    = captureTs(ts);
+      let record  = null;
+      if (dsm) {
+        const target = dsm.destinationJid || (group ? arrived : (this._isOwnUser(arrived) && attrs.recipient) || null);
+        if (target) {
+          record = {
+            chat: this._captureChat(target, [attrs.peer_recipient_pn, attrs.peer_recipient_lid], true),
+            fromMe: true, raw: dsm.messageRaw
+          };
+        }
+      } else if (group) {
+        const fromMe = this._isOwnUser(participant);
+        record = { chat: arrived, fromMe, participant: fromMe ? undefined : (captureJid(participant) || undefined), raw: plaintext };
+      } else {
+        record = {
+          chat: this._captureChat(arrived, [senderPn, attrs.sender_lid], true),
+          fromMe: this._isOwnUser(arrived), raw: plaintext
+        };
+      }
+      if (!record || !record.chat) {
+        // A status or a channel post one of our other devices sent, or one of
+        // ours that names no chat at all: out of flight, and nothing more.
+        store.recordIncoming({ id, chat: arrived, ts: at, info: { kind: 'skip' } });
+        return;
+      }
+      // A stanza marked as an edit carries the new content under the old id.
+      const kept = storable(captureInfo(seen, attrs.edit ? id : undefined), record.raw);
+      store.recordIncoming({
+        id, chat: record.chat, fromMe: record.fromMe, participant: record.participant, ts: at,
+        pushName: !record.fromMe && attrs.notify ? String(attrs.notify) : undefined,
+        raw: kept.raw, info: kept.info
+      });
+    });
+  }
+
+  // Receipts move the status of the messages they name. One from another of
+  // our own devices is about the chat it names, and says that chat was read.
+  _captureReceipt(node) {
+    this._capture('receipt', store => {
+      const attrs  = node.attrs || {};
+      const type   = attrs.type ? String(attrs.type) : '';
+      const status = receiptStatus(type);
+      if (status === undefined) return;
+      const from   = String(attrs.from || '');
+      const ours   = this._isOwnUser(attrs.participant || from);
+      const chat   = this._captureChat(ours && attrs.recipient && !from.endsWith('@g.us') ? attrs.recipient : from);
+      if (!chat) return;
+      const list   = findChild(node, 'list');
+      const items  = list && Array.isArray(list.content) ? list.content : [];
+      const ids    = [attrs.id, ...items.filter(c => c && c.description === 'item').map(c => c.attrs && c.attrs.id)]
+        .filter(Boolean).map(String);
+      if (!ids.length) return;
+      store.setStatus(chat, ids, status);
+      if (type === 'read-self' || (ours && status >= receiptStatus('read'))) store.markRead(chat);
+    });
+  }
+
+  // This client read messages in a chat: its read receipt has gone out, from
+  // markRead or as a message arrived with autoRead on. The chat is read, and
+  // so are the messages the receipt named — someone else's, never our own.
+  _captureRead(jid, ids, played, sender) {
+    this._capture('read', store => {
+      const chat = this._captureChat(jid);
+      if (!chat) return;
+      const named = (ids || []).filter(Boolean).map(String);
+      if (named.length && !this._isOwnUser(sender || jid)) {
+        const { STATUS } = require('./primary/MessageStore');
+        store.setStatus(chat, named, played ? STATUS.PLAYED : STATUS.READ);
+      }
+      store.markRead(chat);
+    });
+  }
+
+  // ── What MessageSender sends ──
+  //
+  // A send is recorded as PENDING before anything goes out, and the record
+  // then follows it: a retry that has to go out under a new id rekeys it
+  // instead of adding a second, the server's ack raises it, a refusal marks
+  // it. `capture` is that one send's state, made in MessageSender._sendMessage
+  // and handed down through every retry; it remembers the id the send was
+  // last recorded under.
+
+  _captureOutgoing(capture, to, id, raw, edit) {
+    this._capture('outgoing', () => {
+      const chat = this._captureChat(to, [], true);
+      if (!chat) return;
+      // An edit stanza carries the new content under the id it replaces.
+      const kept = storable(captureInfo(captureView(this._decodeMsg(raw), raw), edit ? id : undefined), raw);
+      if (kept.info.kind === 'skip') return;
+      Object.assign(capture, { chat, raw: kept.raw, info: kept.info, ts: Math.floor(Date.now() / 1000) });
+      this._captureOutgoingAs(capture, id);
+    });
+  }
+
+  _captureOutgoingAs(capture, id) {
+    this._capture('outgoing', store => {
+      if (!capture.chat) return;
+      const supersedes = capture.id && capture.id !== id ? capture.id : undefined;
+      // The send is under `id` now, whether or not this record lands.
+      capture.id = id;
+      store.recordOutgoing({ id, chat: capture.chat, ts: capture.ts, raw: capture.raw, info: capture.info, supersedes });
+    });
+  }
+
+  // The server took it: an ack that carries its time.
+  _captureSent(capture, result) {
+    this._capture('status', store => {
+      if (!capture.id || !result || !result.t) return;
+      const { STATUS } = require('./primary/MessageStore');
+      store.setStatus(capture.chat, [capture.id], STATUS.SERVER_ACK);
+    });
+  }
+
+  // Refused, or failed before it could go out. One that died with the
+  // connection may have reached the server all the same, so it stays PENDING.
+  _captureRejected(capture) {
+    this._capture('status', store => {
+      if (!capture.id || !this._connected) return;
+      const { STATUS } = require('./primary/MessageStore');
+      store.setStatus(capture.chat, [capture.id], STATUS.ERROR);
+    });
+  }
+
+  // editMessage and deleteMessage: this client's own edit or deletion, applied
+  // as it is made, the way the phone shows it. The stanza that carries one is
+  // not a message of its own and goes out with _noRecord.
+  _captureEdit(to, id, raw) {
+    this._capture('edit', store => {
+      const chat = this._captureChat(to, [], true);
+      const kept = storable({ kind: 'content' }, raw);
+      if (chat && !kept.info.viewOnce) store.recordEdit(chat, id, kept.raw, Math.floor(Date.now() / 1000));
+    });
+  }
+
+  _captureDelete(to, id, forEveryone) {
+    this._capture('delete', store => {
+      const chat = this._captureChat(to, [], true);
+      if (!chat) return;
+      if (forEveryone) { store.tombstone(chat, id, 'revoked'); return; }
+      // Deleted for me: gone, under whichever name of the chat it was kept.
+      const addressed = captureJid(to);
+      for (const name of new Set([chat, addressed, captureJid(this._counterpartJid(addressed))])) {
+        if (name) store.drop(name, id);
+      }
+    });
+  }
+
+  // ─── Receipt / ack ────────────────────────────────────────────────────────
+
+  _handleReceipt(node) {
+    const attrs = node.attrs || {};
+    this.emit('receipt', {
+      id:   attrs.id   ? String(attrs.id) : '',
+      from: attrs.from ? String(attrs.from) : '',
+      type: attrs.type ? String(attrs.type) : ''
+    });
+    this._captureReceipt(node);
+    // ACK the receipt back to server (include type so server clears from offline queue)
+    if (this._socket && this._connected) {
+      const ackAttrs = {
+        id:    attrs.id || '',
+        class: 'receipt',
+        to:    attrs.from || ''
+      };
+      if (attrs.type) ackAttrs.type = String(attrs.type);
+      if (attrs.participant) ackAttrs.recipient = String(attrs.participant);
+      this._socket.sendNode(new BinaryNode('ack', ackAttrs, null));
+    }
+    // If the recipient couldn't decrypt our message, re-send with fresh Signal session
+    if (String(attrs.type || '') === 'retry') {
+      this._handleRetryFromRecipient(attrs);
+    }
+  }
+
+  _handleRetryFromRecipient(attrs) {
+    const msgId = String(attrs.id || '');
+    const cached = this._sentMsgCache && this._sentMsgCache.get(msgId);
+    if (!cached || !this._sender) {
+      _whaDbg('[DBG] RETRY_RECV msgId=' + msgId + ' — no cached plaintext, skipping resend\n');
+      return;
+    }
+
+    // Consume the entry before doing anything else. Every device that failed to
+    // decrypt sends its own retry receipt for the same message, and a group
+    // resend already re-addresses all of them — without this, each receipt
+    // started its own resend.
+    this._sentMsgCache.delete(msgId);
+
+    // Bound the chain. A resend that still cannot be decrypted draws fresh
+    // retry receipts of its own, so an unbounded handler answers each one with
+    // another send and floods the chat. Give up after a few rounds and leave
+    // the message undelivered rather than keep spamming.
+    const depth = (cached.retryDepth || 0) + 1;
+    if (depth > this._maxRetryResends) {
+      _whaDbg('[DBG] RETRY_RECV msgId=' + msgId + ' — giving up after ' +
+        cached.retryDepth + ' resends\n');
+      return;
+    }
+
+    const fromStr = attrs.from ? String(attrs.from) : '';
+    const isGroup = fromStr.endsWith('@g.us');
+
+    // On a group retry `from` is the group and `participant` is the device that
+    // failed to decrypt. Keying off `from` there would have targeted the group
+    // id as if it were a contact and cleared nothing.
+    const targetJid = isGroup && attrs.participant
+      ? String(attrs.participant)
+      : fromStr;
+    const recipientPhone = targetJid.split('@')[0].split(':')[0].split('.')[0];
+
+    _whaDbg('[DBG] RETRY_RECV msgId=' + msgId + ' from=' + fromStr +
+      ' — clearing session + resending\n');
+
+    // Everything above this point stays synchronous on purpose. Every device
+    // that could not read the message sends its own receipt, and the cache
+    // entry taken above is what makes only the first of them resend — put an
+    // await in front of it and they all pass the check together.
+    //
+    // From here on it is one at a time. Tearing a contact's sessions down and
+    // building them back up is not something two receipts can be doing at once:
+    // the second purge lands in the middle of the first resend and deletes the
+    // session it had just created, so the resend goes out under a session the
+    // recipient no longer has and draws another retry.
+    return this._queueIncoming(this._receiptMutex, 'RETRY', async () => {
+      this._purgeContactSessions(recipientPhone, 'RETRY');
+
+      // Re-send the message — will create fresh pre-key (pkmsg) sessions.
+      // A group resend must go back through the group path: it needs a fresh
+      // SenderKey distribution, which only _sendGroupMessage builds. Drop the
+      // "already distributed" record first, or the resend would carry the same
+      // bare skmsg the recipient just told us it could not read.
+      // Carry the round count into the resend so its own retry receipts continue
+      // the same chain instead of restarting it at zero.
+      //
+      // _noRecord: the primary store already holds this message under the id
+      // it first went out with. A resend is that message again, not another.
+      const opts = Object.assign({}, cached.options, { _retryDepth: depth, _noRecord: true });
+
+      if (cached.isGroup) {
+        const resendId = generateMessageId();
+        if (this._signal && this._signal.senderKeyStore) {
+          this._signal.senderKeyStore.invalidateSKDM(cached.toJid);
+        }
+        _whaDbg('[DBG] RETRY_RESEND group round=' + depth + ' newId=' + resendId + '\n');
+        // Awaited inside the queue, so the next receipt's purge cannot land
+        // while this resend is still choosing and building sessions.
+        await this._sender._sendGroupMessage(
+          cached.toJid, resendId, cached.plaintext, cached.mediaType, opts
+        )
+          .then(r  => _whaDbg('[DBG] RETRY_RESEND group ok id=' + (r && r.id) + '\n'))
+          .catch(e => _whaDbg('[DBG] RETRY_RESEND_ERR: ' + e.message));
+        return;
+      }
+
+      await this._sender._sendDMMessage(
+        cached.toJid, cached.msgId, cached.plaintext, cached.mediaType, opts
+      )
+        .then(r  => _whaDbg('[DBG] RETRY_RESEND ok id=' + r.id + '\n'))
+        .catch(e => _whaDbg('[DBG] RETRY_RESEND_ERR: ' + e.message));
+    });
+  }
+
+  _handleAck(node) {
+    const attrs  = node.attrs || {};
+    const id     = attrs.id   || '';
+    const cls    = attrs.class || '';
+    const error  = attrs.error ? String(attrs.error) : '';
+
+    if (cls === 'message') {
+      const handler = this._pendingAcks.get(id);
+      if (handler) {
+        this._pendingAcks.delete(id);
+        handler(attrs);
+      }
+
+      // ─── Error 463 ───────────────────────────────────────────────────────
+      // 463 recovery is fully handled inside MessageSender._dispatchAndAck:
+      // it issues the privacy token then automatically re-sends the message
+      // so the caller's promise resolves transparently (no loop).
+      // Nothing to do here — the pendingAck handler above already drove the
+      // recovery via _inFlight463Recoveries + _issuePrivacyTokens.
+      // ────────────────────────────────────────────────────────────────────
+    }
+  }
+
+  // Delivery ack — sent immediately on message receipt.
+  // Signals the server that the message was delivered → gives sender 2 grey checkmarks.
+  // fromJid / partJid are raw JID objects so BinaryNode encodes them as AD_JID
+  // (agent:device bytes), which is required for correct server-side routing.
+  _sendMessageAck(msgId, fromJid, partJid) {
+    if (!this._socket || !this._connected) return;
+    const attrs = { id: msgId, class: 'message', to: fromJid };
+    if (partJid && String(partJid) !== String(fromJid)) attrs.participant = partJid;
+    this._socket.sendNode(new BinaryNode('ack', attrs, null));
+  }
+
+  // A read receipt only tells the sender we read it when read receipts are on.
+  // With them off, "read" is downgraded to "read-self", which marks the message
+  // read across our own devices without reporting it to the other side. Nothing
+  // here looked at the setting, so a user who had turned read receipts off
+  // still sent blue ticks.
+  _readReceiptType(base) {
+    const settings = this._privacySettings;
+    if (settings && settings.readReceipts === 'none' && base === 'read') {
+      return 'read-self';
+    }
+    return base;
+  }
+
+  // The key a privacy token is stored and looked up under.
+  //
+  // It resolves to the contact's LID, falling back to the plain JID only when
+  // no LID is known:
+  //
+  //     if (isLidUser(jid)) return jid
+  //     const lid = await getLIDForPN(jid)
+  //     return lid ?? jid
+  //
+  // whalibmob resolved it on the receiving side but not on the sending side,
+  // which put the two halves out of step: a token a contact issued us arrived
+  // on a privacy_token notification and was filed under their LID, while every
+  // send looked it up under their phone JID and found nothing. The token was
+  // therefore never attached to anything, and the server kept counting our
+  // messages as anonymous reach-outs — which is what error 463 is.
+  _resolveTcTokenJid(jid) {
+    const { normalizeJidForTcToken } = require('./messages/TcTokenStore');
+    const norm = normalizeJidForTcToken(jid);
+    if (norm.endsWith('@lid')) return norm;
+
+    const pnUser = norm.split('@')[0];
+    let lidUser = this._pnToLid && this._pnToLid.get(pnUser);
+
+    // The in-memory map starts empty and is filled by usync and by incoming
+    // messages, so a send early in a process — or one that hits a warm device
+    // cache and never runs usync — could find nothing and fall back to the
+    // phone JID. The mapping is on disk in the Signal store either way, so
+    // consult that before giving up. The consequence of not doing so is not
+    // cosmetic: the lookup lands on
+    // a key with no token while a live one sits under the LID, and the message
+    // goes out without one.
+    if (!lidUser) {
+      const store = this._signal && this._signal.store;
+      const persisted = store && typeof store.getLidMappings === 'function'
+        ? store.getLidMappings() : null;
+      const fromDisk = persisted && persisted[pnUser];
+      if (fromDisk) {
+        lidUser = String(fromDisk);
+        if (this._pnToLid) this._pnToLid.set(pnUser, lidUser);
+        if (this._lidToPn) this._lidToPn.set(lidUser, pnUser);
+        _whaDbg('[DBG] TCTOKEN_LID_FROM_DISK pn=' + pnUser + ' lid=' + lidUser);
+      }
+    }
+
+    if (!lidUser) return norm;
+
+    const lidJid = lidUser + '@lid';
+
+    // Anything already filed under the phone JID belongs with the LID entry.
+    // Left split, the two halves each hold part of the state and neither is
+    // complete. Cheap when there is nothing to move, which is the usual case.
+    if (this._tcTokenStore && this._tcTokenStore.mergeEntry(norm, lidJid)) {
+      _whaDbg('[DBG] TCTOKEN_MERGED ' + norm + ' → ' + lidJid);
+    }
+
+    return lidJid;
+  }
+
+  // The JID a token is *issued* to, which is not the JID it is *stored* under.
+  //
+  // Storage is always the LID. Issuance follows AB prop 14303
+  // (lid_trusted_token_issue_to_lid), whose WA Web default is off — so the IQ
+  // names the phone JID. We follow WA Web, and more importantly we now follow
+  // it in one place: the
+  // send path, the 463 recovery and the post-identity-change re-issue used to
+  // each pick a different address family for the same contact.
+  _resolveTcTokenIssuanceJid(jid) {
+    const { normalizeJidForTcToken } = require('./messages/TcTokenStore');
+    const norm = normalizeJidForTcToken(jid);
+    if (!norm.endsWith('@lid')) return norm;
+    const pnUser = this._lidToPn && this._lidToPn.get(norm.split('@')[0]);
+    return pnUser ? pnUser + '@s.whatsapp.net' : norm;
+  }
+
+  // The one way to read a token that is safe to put on the wire.
+  //
+  // Every attach site goes through here, and an expired token returns nothing.
+  // The expiry check used to be on the message path only; presence subscribe,
+  // group create, participant add and the
+  // profile-picture query each tested `token.length` and nothing else, so once
+  // a token aged past the 28-day window those four kept sending it. Same rule
+  // everywhere now, and the dead token gets cleared on the way out.
+  _tcTokenFor(jid) {
+    if (!this._tcTokenStore) return null;
+    const { tcTokenExpired } = require('./messages/TcTokenStore');
+    const tcJid = this._resolveTcTokenJid(jid);
+    const entry = this._tcTokenStore.get(tcJid);
+    if (!entry || !entry.token || !entry.token.length) return null;
+    if (tcTokenExpired(entry.timestamp)) {
+      this._tcTokenStore.clearToken(tcJid);
+      _whaDbg('[DBG] TCTOKEN_EXPIRED jid=' + tcJid + ' — cleared');
+      return null;
+    }
+    return entry.token;
+  }
+
+  // True when a JID names this account, in either address family.
+  _isOwnUser(jid) {
+    if (!jid) return false;
+    const user = String(jid).split('@')[0].split(':')[0];
+    if (!user) return false;
+    if (user === String(this._store && this._store.phoneNumber)) return true;
+    const ownLid = this._myLid ? String(this._myLid).split('@')[0].split(':')[0] : null;
+    return !!ownLid && user === ownLid;
+  }
+
+  // Delivery receipt — the sender's two grey ticks.
+  //
+  // Distinct from the <ack> above: the ack tells the server we took the stanza,
+  // the receipt tells the sender it reached a device. Both go out for every
+  // incoming message, with the blue ticks left to markRead. Only the ack used
+  // to be sent, jumping straight to type="read", so a sender never saw the grey
+  // stage.
+  //
+  // A client that has not marked itself available sends this with
+  // type="inactive": the sender's app records the delivery but does not render
+  // it, which is how WhatsApp Web behaves in the background.
+  _sendDeliveryReceipt(msgId, fromJid, partJid) {
+    if (!this._socket || !this._connected) return;
+    const attrs = { id: msgId, to: fromJid };
+    if (partJid && String(partJid) !== String(fromJid)) attrs.participant = partJid;
+    // A message that came from one of our own other devices is receipted with
+    // type="sender", never as a delivery to ourselves.
+    if (this._isOwnUser(partJid || fromJid)) {
+      attrs.type = 'sender';
+    } else if (!this._sendActiveReceipts) {
+      attrs.type = 'inactive';
+    }
+    this._socket.sendNode(new BinaryNode('receipt', attrs, null));
+  }
+
+  // Read receipt — the sender's two blue ticks.
+  //
+  // Sent automatically after a message decodes unless autoRead is turned off, in
+  // which case marking a chat read is up to the caller via markRead(). Turning
+  // it off makes read receipts always explicit.
+  // fromJid / partJid are raw JID objects (AD_JID encoding for correct routing).
+  _sendReadReceipt(msgId, fromJid, partJid) {
+    if (!this._socket || !this._connected) return;
+    if (this.autoRead === false) return;
+    const node = new BinaryNode('receipt', {
+      id:   msgId,
+      type: this._readReceiptType('read'),
+      to:   fromJid,
+      t:    String(Math.floor(Date.now() / 1000))
+    }, null);
+    if (partJid && String(partJid) !== String(fromJid)) {
+      node.attrs.participant = partJid;
+    }
+    this._socket.sendNode(node);
+    this._captureRead(fromJid, [msgId], false, partJid || fromJid);
+  }
+
+  // ─── Retry request (when decryption fails) ────────────────────────────────
+  // Retry request behaviour:
+  //   - <retry count v='1' error='0' t=<orig_t>>
+  //   - <registration> 4-byte reg-id
+  //   - <keys> block (from retry #1): type + identity + key + skey + device-identity
+
+  // A message we asked to be re-sent finally decrypted (or we gave up on it).
+  // Release its reserved prekey so the pool does not drain over a long session.
+  _resolveRetry(msgId) {
+    const pending = this._retryPending.get(msgId);
+    if (!pending) return;
+    if (pending.pkId !== null && pending.pkId !== undefined) {
+      this._retryAdvertisedPreKeys.delete(pending.pkId);
+    }
+    this._retryPending.delete(msgId);
+  }
+
+  // Drop every Signal session and cached device list a contact owns, so the
+  // next send to them has to fetch a prekey bundle and open a fresh session.
+  //
+  // A contact holds a session under each address family: a Signal address is
+  // (user, device) with the server stripped, and the LID user and the phone
+  // user are different strings, so one session is not reachable under the
+  // other's name. Clearing only the family whose name happened to be at hand
+  // leaves the other in place, and the next send picks it straight back up —
+  // which is how a message stayed undecryptable on a device that had already
+  // said it could not read it.
+  //
+  // Device lists are filed the same way, LID ones under a "lid:" key, so both
+  // spellings of both users have to go.
+  //
+  // Returns the set of users it resolved, for callers that want to log it.
+  _purgeContactSessions(user, tag) {
+    const label = tag || 'PURGE';
+    const users = new Set([String(user)]);
+    const mappedPn  = this._lidToPn && this._lidToPn.get(user);
+    const mappedLid = this._pnToLid && this._pnToLid.get(user);
+    if (mappedPn)  users.add(mappedPn);
+    if (mappedLid) users.add(mappedLid);
+
+    const sigStore = this._signal && this._signal.store;
+    if (sigStore && sigStore._sessions) {
+      const sessions = sigStore._sessions;
+      for (const addr of Object.keys(sessions)) {
+        // Match on the address's user segment rather than a bare string
+        // prefix: a purge for "407" must not take "4071.0" with it.
+        const addrUser = addr.slice(0, addr.lastIndexOf('.'));
+        if (users.has(addrUser)) {
+          _whaDbg('[DBG] ' + label + ' deleting session for ' + addr);
+          // Through the store rather than off the object it hands back: a bare
+          // `delete` leaves the file alone and the store unmarked, so nothing
+          // is written on the way out and a restart loads every purged session
+          // straight back — the one case the purge exists to prevent. Not
+          // awaited on purpose; the method's body is synchronous, so the
+          // delete and the save have both happened by the time it returns.
+          sigStore.deleteSession(addr);
+        }
+      }
+    }
+
+    if (this._devMgr) {
+      const cacheKeys = [];
+      for (const u of users) cacheKeys.push(u, 'lid:' + u);
+      this._devMgr.clearCache(cacheKeys);
+    }
+
+    _whaDbg('[DBG] ' + label + ' purged users=[' + [...users].join(',') + ']');
+    return users;
+  }
+
+  // Hold a sent message's plaintext so a retry receipt naming it can be
+  // answered. Both send paths file their entry here so the bound lives in one
+  // place instead of being repeated as a literal at each call site.
+  _cacheSentMessage(entry) {
+    if (!this._sentMsgCache || !entry || !entry.msgId) return;
+    this._sentMsgCache.set(entry.msgId, entry);
+    // Map preserves insertion order, so the first key is the oldest entry.
+    while (this._sentMsgCache.size > this._sentCacheSize) {
+      this._sentMsgCache.delete(this._sentMsgCache.keys().next().value);
+    }
+  }
+
+  _sendRetryRequest(msgId, origNode) {
+    const existing = this._retryPending.get(msgId);
+    const count    = existing ? existing.count + 1 : 1;
+    if (count > 5) return;
+
+    if (!this._socket || !this._connected) return;
+
+    // Ask the phone as well, for the first couple of rounds.
+    //
+    // The retry receipt asks the *sender* to encrypt it again, which only helps
+    // when their session is the thing that went wrong. When ours is — a spent
+    // pre-key, a ratchet that moved on — no amount of asking them helps, and
+    // the plaintext is sitting on our own phone the whole time. The reference
+    // client asks both, and gives up on the phone after two rounds.
+    //
+    // Deliberately not awaited: a retry receipt must go out now, and this is a
+    // slower second route to the same message.
+    if (count <= 2) {
+      const attrs = (origNode && origNode.attrs) || {};
+      const from  = attrs.from ? String(attrs.from) : null;
+      if (from) {
+        this.requestPlaceholderResend({
+          remoteJid: from,
+          fromMe:    false,
+          id:        msgId
+        }).catch(err =>
+          _whaDbg('[DBG] PLACEHOLDER request failed: ' + (err && err.message)));
+      }
+    }
+
+    // Pick a prekey that is not already advertised by another unresolved retry.
+    // A prekey is deleted the moment a pkmsg using it is decrypted, so handing
+    // the same one to two senders means the second arrives after the key is
+    // gone and dies with "Invalid PreKey ID". Indexing modulo the key count
+    // could not prevent that: the list shrinks as keys are consumed, so the
+    // rotating index wraps back onto ids that are still in flight.
+    let pkId = existing ? existing.pkId : null;
+    if (pkId === null && this._signal) {
+      const allKeys = this._signal.getPreKeysForUpload(INITIAL_PREKEY_COUNT);
+      const free = allKeys.find(k => !this._retryAdvertisedPreKeys.has(k.keyId));
+      // If every key is already spoken for, fall back to rotating rather than
+      // sending no bundle at all — a stale id beats no retry.
+      const chosen = free || allKeys[this._retryPreKeyIdx++ % Math.max(1, allKeys.length)];
+      if (chosen) {
+        pkId = chosen.keyId;
+        this._retryAdvertisedPreKeys.add(pkId);
+      }
+    }
+    this._retryPending.set(msgId, { node: origNode, count, pkId });
+
+    // Use original message timestamp (not current time)
+    const origAttrs = (origNode && origNode.attrs) || {};
+    const origT = origAttrs.t ? String(origAttrs.t) : String(Math.floor(Date.now() / 1000));
+    // Raw JID object from original node — AD_JID encoding ensures correct server routing
+    const fromJid = origAttrs.from || null;
+
+    const children = [
+      new BinaryNode('retry', { count: String(count), id: msgId, t: origT, v: '1', error: '0' }, null),
+      new BinaryNode('registration', {}, intToBytes(this._store.registrationId, 4))
+    ];
+
+    // Include prekey bundle (from retry #1) so sender re-establishes Signal session (pkmsg)
+    if (this._signal) {
+      try {
+        const spk        = this._signal.getSignedPreKeyForUpload();
+        const identKey   = this._signal.getIdentityKey();
+        const allPreKeys = this._signal.getPreKeysForUpload(INITIAL_PREKEY_COUNT);
+        const pk         = allPreKeys.find(k => k.keyId === pkId) || allPreKeys[0];
+
+        if (spk && identKey && pk) {
+          const keysChildren = [
+            new BinaryNode('type',     {}, Buffer.from([5])),
+            new BinaryNode('identity', {}, stripKeyPrefix(identKey)),
+            new BinaryNode('key', {}, [
+              new BinaryNode('id',    {}, intToBytes(pk.keyId, 3)),
+              new BinaryNode('value', {}, stripKeyPrefix(pk.pubKey))
+            ]),
+            new BinaryNode('skey', {}, [
+              new BinaryNode('id',        {}, intToBytes(spk.keyId, 3)),
+              new BinaryNode('value',     {}, stripKeyPrefix(spk.keyPair.pubKey)),
+              new BinaryNode('signature', {}, spk.signature)
+            ])
+          ];
+
+          // device-identity — include WITH accountSignatureKey (no strip)
+          const advBytes = buildOrGetAdvIdentity(this._store);
+          if (advBytes && advBytes.length > 0) {
+            keysChildren.push(new BinaryNode('device-identity', {}, advBytes));
+            _whaDbg('[DBG] RETRY #' + count + ' for ' + msgId + ' — preKeyId=' + pk.keyId + ' +device-identity(' + advBytes.length + 'b)\n');
+          } else {
+            _whaDbg('[DBG] RETRY #' + count + ' for ' + msgId + ' — preKeyId=' + pk.keyId + ' (no advIdentity)\n');
+          }
+
+          children.push(new BinaryNode('keys', {}, keysChildren));
+        }
+      } catch (e) {
+        _whaDbg('[DBG] RETRY prekey bundle error: ' + e.message);
+      }
+    }
+
+    // Mirror participant/recipient from original node attrs if present
+    // Use raw JID objects so BinaryNode encodes them as AD_JID (correct routing)
+    const receiptAttrs = {
+      id:   msgId,
+      type: 'retry',
+      to:   fromJid,
+      t:    String(Math.floor(Date.now() / 1000))
+    };
+    if (origAttrs.recipient)   receiptAttrs.recipient  = origAttrs.recipient;
+    if (origAttrs.participant) receiptAttrs.participant = origAttrs.participant;
+
+    _whaDbg('[DBG] RETRY #' + count + ' receipt to=' + JSON.stringify(fromJid) + ' participant=' + JSON.stringify(origAttrs.participant || null));
+    this._socket.sendNode(new BinaryNode('receipt', receiptAttrs, children));
+  }
+
+  // ─── Notification handling ────────────────────────────────────────────────
+
+  // <privacy><category name="..." value="..."/></privacy> inside an account_sync
+  // notification. The node carries only what changed, so it is folded into the
+  // cached settings rather than replacing them.
+  _handlePrivacySettingsNotification(node) {
+    const changed = this._parsePrivacySettings(node);
+    const merged  = Object.assign({}, this._privacySettings || {});
+    const changes = {};
+    for (const key of Object.keys(changed)) {
+      if (changed[key] !== null) { merged[key] = changed[key]; changes[key] = changed[key]; }
+    }
+    this._privacySettings = merged;
+    _whaDbg('[DBG] PRIVACY_CHANGE ' + JSON.stringify(changes));
+    this.emit('privacy_settings', { changes, settings: merged });
+  }
+
+  // <blocklist action="..." dhash="..." prev_dhash="..."><item jid=... action=.../></blocklist>
+  // The action on the node describes the whole change; each child names one JID
+  // and what happened to it.
+  _handleBlocklistNotification(node) {
+    const attrs   = node.attrs || {};
+    const changes = [];
+    if (Array.isArray(node.content)) {
+      for (const child of node.content) {
+        if (!child || !child.attrs || !child.attrs.jid) continue;
+        changes.push({
+          jid:    String(child.attrs.jid),
+          action: child.attrs.action ? String(child.attrs.action) : null
+        });
+      }
+    }
+    _whaDbg('[DBG] BLOCKLIST_CHANGE action=' + (attrs.action || '') +
+      ' changes=' + changes.map(c => c.action + ':' + c.jid).join(','));
+    this.emit('blocklist', {
+      action:    attrs.action     ? String(attrs.action)     : null,
+      dhash:     attrs.dhash      ? String(attrs.dhash)      : null,
+      prevDhash: attrs.prev_dhash ? String(attrs.prev_dhash) : null,
+      changes
+    });
+  }
+
+  _handleNotification(node) {
+    const attrs = node.attrs || {};
+    const type  = attrs.type || '';
+
+    this.emit('notification', { type, attrs, node });
+
+    if (type === 'encrypt') {
+      // Server tells us pre-keys are running low
+      this._checkAndReplenishPreKeys();
+    }
+
+    // The sender's phone answering a re-upload request — see
+    // requestMediaRetry(). Surfaced raw as well as decrypted, since only the
+    // caller holds the media key the payload is encrypted under.
+    if (type === 'mediaretry') {
+      try {
+        const { parseRetryNotification } = require('./messages/MediaRetry');
+        const parsed = parseRetryNotification(node, {
+          findChild, getContent: getNodeContent
+        });
+        if (parsed) {
+          _whaDbg('[DBG] MEDIA_RETRY notification id=' + parsed.messageId +
+            (parsed.error ? ' error=' + parsed.error.code : ' payload=' +
+              (parsed.ciphertext ? parsed.ciphertext.length + 'B' : 'none')));
+          this.emit('media_retry', parsed);
+        }
+      } catch (err) {
+        _whaDbg('[DBG] MEDIA_RETRY parse failed: ' + (err && err.message));
+      }
+      return;
+    }
+
+    if (type === 'account_sync') {
+      // Account sync notification — may contain device list updates
+      const devicesNode = findChildDeep(node, 'devices');
+      if (devicesNode) this._processDeviceUpdate(devicesNode);
+      // ...and block list changes. Blocking someone from the phone arrives
+      // here; nothing was watching for it, so the client's idea of who is
+      // blocked only ever changed when it did the blocking itself.
+      const blocklistNode = findChildDeep(node, 'blocklist');
+      if (blocklistNode) this._handleBlocklistNotification(blocklistNode);
+      // ...and privacy setting changes, which arrive the same way. The settings
+      // are re-read on this and an event raised; nothing was watching the node,
+      // so a change made on the phone never reached the cache.
+      const privacyNode = findChildDeep(node, 'privacy');
+      if (privacyNode) this._handlePrivacySettingsNotification(privacyNode);
+      // ...and Terms-of-Service acceptances. Accepting a notice on the phone
+      // arrives here, and it is the only way this side learns about it without
+      // asking.
+      const tosNode = findChildDeep(node, 'tos');
+      if (tosNode) this._handleTosNotification(tosNode);
+    }
+
+    if (type === 'w:gp2') {
+      // Group update: member add/remove
+      this._processGroupUpdate(node);
+    }
+
+    if (type === 'mex') {
+      this._handleMexNotification(node);
+    }
+
+    if (type === 'picture') this._handlePictureNotification(node);
+    if (type === 'status')  this._handleAboutNotification(node);
+    if (type === 'newsletter') this._handleNewsletterNotification(node);
+
+    if (type === 'privacy_token') {
+      // Incoming trusted-contact token from a conversation partner — store it
+      // so we can attach it on next DM send (prevents error 463).
+      this._handlePrivacyTokenNotification(node);
+    }
+
+    if (type === 'link_code_companion_reg') {
+      if (this._mode === 'web') {
+        // Companion-side flow remains unchanged.
+        this._handleCompanionFinish(node);
+      } else {
+        try { this._primaryLinkingForSession().handleNotification(node); }
+        catch (error) {
+          this.emit('primary_link_error', {
+            code: error && typeof error.code === 'string' && error.code.startsWith('PRIMARY_LINK_') ? error.code : 'PRIMARY_LINK_NOTIFICATION_REJECTED',
+            scope: 'notification', operationId: this._primaryLinking?.notificationOperationId(node) || null
+          });
+        }
+        // Primary handler owns durability and the transport ACK.
+        return;
+      }
+    }
+
+    // The three below only mean anything to a companion that is not linked
+    // yet, and only when they come from the server itself.
+    if (this._mode === 'web' && this._store && !this._store.registered &&
+        isServerJid(attrs.from)) {
+      if (type === 'passkey_prologue_request') {
+        this._handlePasskeyRequest(node).catch(e =>
+          _whaDbg('[DBG] PASSKEY request handler failed: ' + (e && e.message)));
+      } else if (type === 'crsc_continuation') {
+        this._handlePasskeyContinuation(node).catch(e =>
+          _whaDbg('[DBG] PASSKEY continuation handler failed: ' + (e && e.message)));
+      } else if (type === 'companion_reg_refresh') {
+        if (findChild(node, 'companion_reg_refresh') || findChild(node, 'pair-device-rotate-qr')) {
+          this._rotateAdvSecret();
+        } else {
+          _whaDbg('[DBG] companion_reg_refresh not recognised — ignored');
+        }
+      }
+    }
+
+    if (type === 'md-msg-hist') {
+      // Server signals that history sync data is available.
+      // The actual encrypted notification may arrive as:
+      //   (a) an encrypted <message> containing HistorySyncNotification (primary path, handled in _decryptDMMessage)
+      //   (b) inline in this notification node via an <enc> child (handle here)
+      this._handleMdMsgHistNotification(node);
+    }
+
+    if (type === 'devices') {
+      // Server push: a contact's linked device list changed (they linked or
+      // unlinked a tablet, desktop, etc.).  Invalidate that phone's cache entry
+      // so the next send triggers a fresh usync IQ and reaches all their devices.
+      // BinaryNode decodes an AD-encoded JID into an object, not a string, so
+      // this has to be stringified before it can be split. It was not, and a
+      // <notification type="devices"> from a LID-addressed contact threw
+      // "fromJid.split is not a function" out of the node handler — taking the
+      // whole dispatch down with it, so every notification behind it in the
+      // offline queue was dropped too.
+      const fromJid   = String(attrs.from || '');
+      const fromUser  = fromJid.split('@')[0].split(':')[0];
+      // The user segment of a LID is not a phone number, and usync only takes
+      // phone numbers — asking it about a LID comes back "invalid" and the
+      // device list is never actually refreshed. Translate first when we know
+      // the mapping, and when we do not, invalidate the cache and stop there
+      // rather than spending an IQ on a question that cannot be answered.
+      const isLid     = fromJid.endsWith('@lid');
+      const mappedPn  = isLid && this._lidToPn ? this._lidToPn.get(fromUser) : null;
+      const fromPhone = isLid ? mappedPn : fromUser;
+
+      // A contact has two device lists — one under the phone number, one under
+      // the LID — and the notification carries both: `device_hash` for the list
+      // it is addressed under, `device_lid_hash` for the other one, with each
+      // <device> naming its jid and its lid. The server hashes them separately,
+      // so they are checked separately, and one going wrong does not cost the
+      // other. That matters most for the LID half: a LID cache thrown away for
+      // a contact whose number we do not know cannot be refilled by usync,
+      // which only answers questions about phone numbers.
+      const lidAttr = String(attrs.lid || '');
+      const lidUser = isLid ? fromUser
+                    : (lidAttr ? lidAttr.split('@')[0].split(':')[0] : null);
+      // Free mapping, exactly as the notification states it.
+      if (!isLid && lidUser && fromUser) {
+        if (this._lidToPn) this._lidToPn.set(lidUser, fromUser);
+        if (this._pnToLid) this._pnToLid.set(fromUser, lidUser);
+      }
+
+      // Before throwing the cache away: the notification says what changed and
+      // carries the hash of the list it should produce. Apply it, check the
+      // hash, and if it matches there is nothing to invalidate and nothing to
+      // ask usync about — see DeviceManager.verifyDeviceDelta().
+      if (fromUser && this._devMgr) {
+        const steps = this._parseDeviceDelta(node);
+        if (steps) {
+          // The primary half is keyed the way the notification is addressed.
+          // The secondary half only exists when the notification arrived under
+          // the number and named the LID alongside it.
+          const { primaryOk, lidOk } = this._devMgr.applyDeviceDelta({
+            priKey:    isLid ? 'lid:' + fromUser : fromUser,
+            priUser:   fromUser,
+            priServer: isLid ? 'lid' : 's.whatsapp.net',
+            lidKey:    (!isLid && lidUser) ? 'lid:' + lidUser : null,
+            lidUser:   (!isLid && lidUser) ? lidUser : null,
+            steps
+          });
+
+          if (!isLid && lidUser) {
+            _whaDbg('[DBG] NOTIF_DEVICES lid delta ' +
+              (lidOk ? 'verified' : 'unverified') + ' for lid:' + lidUser);
+          }
+
+          if (primaryOk) {
+            _whaDbg('[DBG] NOTIF_DEVICES delta verified over ' + steps.length +
+              ' step(s) — cache kept, no usync needed');
+            return;
+          }
+        }
+      }
+
+      if (fromUser && this._devMgr) {
+        this._devMgr._dcDel(isLid ? [fromUser, 'lid:' + fromUser] : [fromUser]);
+        if (mappedPn) this._devMgr._dcDel([mappedPn]);
+        _whaDbg('[DBG] NOTIF_DEVICES invalidated cache for ' + fromUser +
+          (isLid ? (mappedPn ? ' (lid → ' + mappedPn + ')' : ' (lid, no phone known)') : ''));
+        // Also process any inline <devices> list the server included
+        const devicesNode = findChildDeep(node, 'devices');
+        if (devicesNode) this._processDeviceUpdate(devicesNode);
+        // Background re-usync so the cache is warm before the next send. Only
+        // when there is a phone number to ask about — the cache is already
+        // cleared, so a LID with no known number simply gets looked up the next
+        // time something sends to it.
+        if (this._signal && fromPhone) {
+          // Queued rather than fired loose. A contact that changes devices
+          // several times in a row — leaving and rejoining a group does it —
+          // sends one of these per change, and two overlapping warm-ups race
+          // each other's session building for the same contact.
+          this._queueIncoming(this._notificationMutex, 'NOTIF', async () => {
+            if (!this._connected || !this._devMgr) return;
+            await this._devMgr.bulkEnsureSessions([fromPhone], this._signal, false)
+              .then(() => _whaDbg('[DBG] NOTIF_DEVICES bg-usync done for ' + fromPhone))
+              .catch(e  => _whaDbg('[DBG] NOTIF_DEVICES bg-usync err: ' + e.message));
+          });
+        }
+      }
+    }
+
+    if (type === 'identity') {
+      // Server push: a contact re-registered WhatsApp (new identity key / new
+      // phone). Every session we hold with them is anchored in an identity key
+      // that no longer exists, so all of them have to go — under both the
+      // number and the LID, or the next send reaches for the survivor and the
+      // contact receives ciphertext nothing on their side can open. A retry
+      // receipt cannot rescue that: the session is not stale, it is dead.
+      const fromJid   = String(attrs.from || '');
+      const fromPhone = fromJid.split('@')[0].split(':')[0];
+      if (fromPhone) this._purgeContactSessions(fromPhone, 'NOTIF_IDENTITY');
+      this.emit('identity_change', { jid: fromJid, user: fromPhone });
+    }
+
+    // Ack the notification
+    if (this._socket && this._connected) {
+      this._socket.sendNode(new BinaryNode('ack', {
+        id:    attrs.id    || '',
+        class: 'notification',
+        type:  type,
+        to:    attrs.from  || 's.whatsapp.net'
+      }, null));
+    }
+  }
+
+  /**
+   * Read a `devices` notification as an ordered list of steps.
+   *
+   *   <notification type="devices" from="…">
+   *     <add device_hash="2:…"><device jid="40711111111:3@s.whatsapp.net"/></add>
+   *     <add device_hash="2:…"><device jid="40711111111:4@s.whatsapp.net"/></add>
+   *   </notification>
+   *
+   * Each child is one change, and the `device_hash` on it is the hash of the
+   * device list **after that change** — not of the notification as a whole. So
+   * children in a multi-change notification carry different hashes, by design,
+   * and each has to be checked against the list as it stands at that point.
+   *
+   * This used to demand that every child agree on one hash and give up when
+   * they did not, which is exactly what a two-change notification looks like:
+   * someone linking a laptop and a tablet in the same sitting produced two
+   * children, two hashes, and the whole thing was thrown away — cache dropped,
+   * full usync round-trip on the next send. Steps are now kept separately and
+   * applied one at a time.
+   *
+   * Children are `add`, `remove`, or `update`. `update` does not name what it
+   * changed, so it survives as a step that tells the applier to drop the cache
+   * and carry on with the rest. A tag this does not know is skipped, and a
+   * child that cannot be read at all rejects the notification: guessing at a
+   * change we could not parse is how a device list quietly goes wrong.
+   *
+   * Each child may also carry `device_lid_hash`, and its `<device>` a `lid`
+   * beside the `jid`, describing the same change to the contact's LID device
+   * list. That half is per-step and optional — a step without it leaves the LID
+   * list alone rather than invalidating the step, because the server hashes the
+   * two lists independently and they are checked independently here.
+   *
+   * @returns {Array<{tag: 'add'|'remove'|'update', deviceId: number|null,
+   *                  hash: string|null, lidDeviceId: number|null,
+   *                  lidHash: string|null}>|null}
+   */
+  _parseDeviceDelta(node) {
+    if (!node || !Array.isArray(node.content)) return null;
+
+    // "user:3@server" / "user@server" → 3 / 0, or null when unreadable.
+    const deviceIdOf = (jid) => {
+      if (!jid) return null;
+      const raw   = String(jid).split('@')[0];
+      const colon = raw.indexOf(':');
+      if (colon < 0) return 0;
+      const device = parseInt(raw.slice(colon + 1), 10);
+      return Number.isFinite(device) ? device : null;
+    };
+
+    const steps = [];
+
+    for (const child of node.content) {
+      if (!child || !child.description) continue;
+      const tag = child.description;
+
+      if (tag === 'update') {
+        steps.push({ tag, deviceId: null, hash: null, lidDeviceId: null, lidHash: null });
+        continue;
+      }
+      if (tag !== 'add' && tag !== 'remove') continue;   // not ours to interpret
+
+      const attrs = child.attrs || {};
+      const hash  = attrs.device_hash ? String(attrs.device_hash) : null;
+      if (!hash) return null;
+
+      const deviceNode = findChild(child, 'device');
+      const dattrs     = (deviceNode && deviceNode.attrs) || {};
+      const deviceId   = deviceIdOf(dattrs.jid);
+      if (deviceId === null) return null;
+
+      // Both halves of the LID pair or neither: a hash with no device to apply
+      // it to, or a device with no hash to check it against, is not a step.
+      const lidHash     = attrs.device_lid_hash ? String(attrs.device_lid_hash) : null;
+      const lidDeviceId = deviceIdOf(dattrs.lid);
+      const haveLid     = !!lidHash && lidDeviceId !== null;
+
+      steps.push({
+        tag,
+        deviceId,
+        hash,
+        lidDeviceId: haveLid ? lidDeviceId : null,
+        lidHash:     haveLid ? lidHash     : null
+      });
+    }
+
+    return steps.length ? steps : null;
+  }
+
+  _processDeviceUpdate(devicesNode) {
+    // Called from _handleNotification(type='account_sync') and type='devices'.
+    // Rebuilds the device cache for the affected phones from the server-provided list.
+    // Previous bug: called Set.add() on cache entries that are number[] arrays → silently failed.
+    if (!Array.isArray(devicesNode.content) || !this._devMgr) return;
+
+    // Group all device IDs per phone from the notification
+    const phoneDevices = new Map();  // phone → number[]
+    for (const deviceNode of devicesNode.content) {
+      if (!deviceNode || deviceNode.description !== 'device') continue;
+      const jid = deviceNode.attrs && deviceNode.attrs.jid;
+      if (!jid) continue;
+      const phone  = String(jid).split('@')[0].split(':')[0];
+      const device = parseInt((String(jid).split(':')[1] || '0').split('@')[0], 10);
+      if (!phoneDevices.has(phone)) phoneDevices.set(phone, []);
+      const ids = phoneDevices.get(phone);
+      if (!ids.includes(device)) ids.push(device);
+    }
+
+    // Replace cache entries atomically per phone (server list is authoritative)
+    for (const [phone, ids] of phoneDevices) {
+      this._devMgr._dcDel([phone]);       // evict stale entry
+      for (const id of ids) this._devMgr._dcAdd(phone, id);
+      _whaDbg('[DBG] DEV_UPDATE phone=' + phone + ' ids=[' + ids.join(',') + ']');
+    }
+  }
+
+  _processGroupUpdate(node) {
+    const groupJid = node.attrs && node.attrs.from;
+    if (!groupJid) return;
+    // Membership/settings just changed — the cached metadata is now stale.
+    // The live _groupMembers set below stays authoritative for this session;
+    // dropping the cache makes the next getGroupMetadata() re-read the server.
+    this.invalidateGroupMetadata(groupJid);
+    if (!this._groupMembers.has(groupJid)) this._groupMembers.set(groupJid, new Set());
+    const members  = this._groupMembers.get(groupJid);
+    const actor    = (node.attrs && node.attrs.participant) ? String(node.attrs.participant) : null;
+    const ts       = (node.attrs && node.attrs.t) ? parseInt(node.attrs.t, 10) : Math.floor(Date.now() / 1000);
+
+    if (!Array.isArray(node.content)) return;
+    for (const child of node.content) {
+      if (!child) continue;
+      const action  = child.description; // 'add','remove','promote','demote','modify','subject','announce','restrict'
+      const targets = [];
+
+      if (['add','remove','promote','demote'].includes(action)) {
+        for (const p of (child.content || [])) {
+          if (p && p.description === 'participant' && p.attrs && p.attrs.jid) {
+            const jid = String(p.attrs.jid);
+            targets.push(jid);
+            if (action === 'add' || action === 'promote')   members.add(jid);
+            if (action === 'remove' || action === 'demote') members.delete(jid);
+          }
+        }
+        if (this._signal) {
+          if (action === 'add') {
+            this._signal.senderKeyStore.invalidateSKDM(groupJid);
+          }
+          if (action === 'remove') {
+            const groupAddressingMode = this._groupAddressingMode.get(groupJid) || 'lid';
+            const senderIdentity = (groupAddressingMode === 'lid' && this._myLid)
+              ? this._myLid
+              : `${this._store.phoneNumber}@s.whatsapp.net`;
+            this._signal.senderKeyStore.delete(groupJid, senderIdentity);
+            this._signal.senderKeyStore.invalidateSKDM(groupJid);
+          }
+        }
+        this.emit('group_update', {
+          type:       action,
+          groupJid,
+          actor,
+          participants: targets,
+          timestamp:  ts
+        });
+      } else if (action === 'modify' || action === 'subject' || action === 'announce' || action === 'restrict') {
+        // settings / subject change
+        const newSubject = action === 'subject'
+          ? (child.attrs && child.attrs.subject) || null
+          : null;
+        this.emit('group_update', {
+          type:      action,
+          groupJid,
+          actor,
+          subject:   newSubject,
+          timestamp: ts
+        });
+      }
+    }
+  }
+
+  // ─── Presence ─────────────────────────────────────────────────────────────
+
+  _handlePresence(node) {
+    const attrs = node.attrs || {};
+    this.emit('presence', {
+      from:      attrs.from || '',
+      available: attrs.type !== 'unavailable'
+    });
+  }
+
+  // ─── Call ─────────────────────────────────────────────────────────────────
+
+  _handleCall(node) {
+    const attrs = node.attrs || {};
+
+    // A <call> can also be the answer to something we asked for — creating a
+    // call link, for one. Those come back on the same tag with the id we sent,
+    // so they have to be handed to the waiting caller and not treated as an
+    // incoming call to reject. A reply to us is not a server push and gets no
+    // ack, which is why this stays ahead of everything below.
+    if (attrs.id) {
+      const handler = this._pendingIqs.get(attrs.id);
+      if (handler) {
+        this._pendingIqs.delete(attrs.id);
+        handler(node);
+        return;
+      }
+    }
+
+    // The server expects to hear that the stanza arrived, for a call exactly as
+    // it does for a message or a notification. Nothing here acknowledged one, so
+    // every incoming call was re-delivered on the next connection — and it goes
+    // out first, before the shape below is looked at, because an unrecognised
+    // call is still a call that reached us.
+    this._sendStanzaAck(node);
+
+    // What the stanza actually says, rather than the raw node alone: which call
+    // it is, and what stage it is at. A caller deciding whether to reject needs
+    // both, and digging them out of the node is not its job.
+    //
+    // All of it lives on the single child, not on the <call> itself, and under
+    // hyphenated names: `call-id` and `call-creator`. This read `call_id` off
+    // the child, which no stanza has ever carried — so the id was always null,
+    // the event announced a call nobody could identify, and the automatic
+    // refusal below was skipped for every call that ever came in. Both spellings
+    // are in the binary token table and only the hyphenated ones are real.
+    const children = Array.isArray(node.content)
+      ? node.content.filter(c => c && c.description) : [];
+    const child  = children.length === 1 ? children[0] : null;
+    const cattrs = (child && child.attrs) || {};
+    const tag    = child ? child.description : '';
+
+    const from   = attrs.from ? String(attrs.from) : '';
+    const callId = cattrs['call-id'] ? String(cattrs['call-id']) : null;
+    // The creator is the account that placed the call. On a one-to-one call it
+    // is the same as the stanza's `from`; in a group they differ, and the
+    // refusal has to name the creator.
+    const creator = cattrs['call-creator'] ? String(cattrs['call-creator']) : from;
+    const status  = CALL_STATUS[tag] || 'unknown';
+
+    // The caller's other name. A LID creator carries its phone number, a phone
+    // creator its LID — whichever side the stanza did not use to address it.
+    const creatorAlt = creator.endsWith('@lid')
+      ? (cattrs.caller_pn  ? String(cattrs.caller_pn)  : null)
+      : (cattrs.caller_lid ? String(cattrs.caller_lid) : null);
+
+    this.emit('call', {
+      from,
+      id:      callId,
+      status,
+      tag,
+      creator,
+      creatorAlt,
+      groupJid: cattrs['group-jid'] ? String(cattrs['group-jid']) : null,
+      platform: attrs.platform ? String(attrs.platform) : null,
+      version:  attrs.version  ? String(attrs.version)  : null,
+      reason:   cattrs.reason  ? String(cattrs.reason)  : null,
+      ts:       attrs.t ? parseInt(attrs.t, 10) : 0,
+      node
+    });
+
+    // Reject every incoming call, unless the caller asked to decide for itself.
+    // Turning this off does not answer calls — nothing here can — it only stops
+    // the automatic refusal, so a caller can reject some and let the rest ring.
+    if (this._autoRejectCalls && callId && status === 'offer') {
+      this.rejectCall(callId, creator);
+    }
+  }
+
+  /**
+   * Refuse one incoming call.
+   *
+   * Only needed when the client was built with `autoRejectCalls: false`; with
+   * the default every call is refused before this could be reached. The call id
+   * and the caller both come off the `call` event — `id` and `creator`.
+   *
+   * @param {string} callId  the `id` from the call event
+   * @param {string} from    the `creator` from the call event
+   * @returns {boolean} whether the refusal could be sent
+   */
+  rejectCall(callId, from) {
+    if (!callId || !this._socket || !this._connected) return false;
+    // Both ends are named without their device: a call belongs to an account,
+    // not to the device that happened to place it.
+    const creator = toNonAdJid(String(from || ''));
+    const ownJid  = toNonAdJid(this._ownJidFor(creator));
+    this._socket.sendNode(new BinaryNode('call', {
+      id:   this._genMsgId(),
+      from: jidStrToObj(ownJid),
+      to:   jidStrToObj(creator)
+    }, [new BinaryNode('reject', {
+      'call-id':      callId,
+      'call-creator': jidStrToObj(creator),
+      count:          '0'
+    }, null)]));
+    return true;
+  }
+
+  // The acknowledgement a server push gets, whatever tag it came in on.
+  //
+  // Mirrors the one the reference client sends: the stanza's own tag as the class, its id,
+  // and back to whoever sent it, carrying `participant` and `recipient` through
+  // when the stanza named them. `type` rides along for everything but a message,
+  // where it means something else entirely.
+  _sendStanzaAck(node) {
+    if (!this._socket || !this._connected) return;
+    const attrs = node.attrs || {};
+    const ack   = {
+      id:    attrs.id || '',
+      class: node.description,
+      to:    attrs.from || 's.whatsapp.net'
+    };
+    if (attrs.participant) ack.participant = attrs.participant;
+    if (attrs.recipient)   ack.recipient   = attrs.recipient;
+    if (attrs.type && node.description !== 'message') ack.type = String(attrs.type);
+    this._socket.sendNode(new BinaryNode('ack', ack, null));
+  }
+
+  // ─── Auth failure (server forces logout during active session) ──────────────
+
+  // <failure> ends the connection, but not every reason means the session died.
+  //
+  // 401, 403 and 419 are the ones that do: the account logged us out, or the
+  // owner removed the device. Those are unrecoverable and reconnecting only
+  // burns attempts.
+  //
+  // 405 is different, and reading it as "session revoked" sent people looking
+  // in the wrong place. It means the server declined the client itself — on the
+  // web endpoint, almost always because the announced version is one it does
+  // not recognise. Nothing about the session is wrong; retrying with the same
+  // version will fail identically, so say what it is instead.
+  _handleFailure(node) {
+    const attrs  = (node && node.attrs) || {};
+    const reason = String(attrs.reason || attrs.location || 'unknown');
+    const loc    = attrs.location ? String(attrs.location) : null;
+
+    if (reason === '405') {
+      const detail = this._mode === 'web'
+        ? 'WhatsApp refused this client (405). The web version we announced (' +
+          ((this._store && this._store.webVersion) || []).join('.') +
+          ') is not one the server accepts — it changes on their schedule. ' +
+          'Reconnect to pick up the current one, or pass { version: [2, 3000, N] } ' +
+          'to connectWeb().'
+        : 'WhatsApp refused this client (405) — the announced app version is ' +
+          'not accepted. Update the version in the session store.';
+      _whaDbg('[DBG] FAILURE 405 location=' + loc + ' — client refused, not a dead session');
+      this._fatal = true;
+      this._reconnecting = false;
+      this.emit('client_rejected', { reason, location: loc, message: detail, node });
+      this.emit('error', new Boom(detail, { statusCode: 405 }));
+      this.disconnect();
+      return;
+    }
+
+    // A temporary ban: the account is fine and the session survives, but the
+    // server will refuse it until the ban runs out. `code` says which kind,
+    // `expireSecs` how long is left.
+    if (reason === '402') {
+      const expire = attrs.expire != null && Number.isFinite(Number(attrs.expire)) ? Number(attrs.expire) : null;
+      this.emit('temporary_ban', {
+        code:       attrs.code != null ? String(attrs.code) : null,
+        expireSecs: expire,
+        expiresAt:  expire != null ? Date.now() + expire * 1000 : null
+      });
+    }
+
+    // Not every failure kills the session. These five do — 401, 403, 405, 406,
+    // 409 — and the rest are worth another attempt. A 500 or a 503 is the
+    // server having a bad minute; giving
+    // up on the session for that would be throwing away a working registration.
+    const LOGGED_OUT = ['401', '403', '405', '406', '409'];
+    const spent = LOGGED_OUT.includes(reason);
+
+    _whaDbg('[DBG] FAILURE reason=' + reason + ' location=' + loc +
+      ' loggedOut=' + spent);
+    this.emit('auth_failure', { reason, location: loc, loggedOut: spent, node });
+    this._fatal = spent;
+    this._reconnecting = false;
+    // A reason that did not kill the session is one to come back from, so this
+    // teardown leaves the reconnect loop armed — a 503 is the server having a
+    // bad minute, not a reason to abandon a working registration. A reason that
+    // did kill it is fatal, and _scheduleReconnect() stands down on that itself.
+    this.disconnect({ reconnect: !spent });
+  }
+
+  // ─── Media connection ─────────────────────────────────────────────────────
+
+  _requestMediaConnection() {
+    if (!this._socket || !this._connected) return;
+    const mcId = this._genMsgId();
+    _whaDbg('[DBG] SEND media_conn IQ id=' + mcId);
+    // Match the reply by request id.  The server echoes back only `from`, `id`
+    // and `type='result'` — it does NOT repeat the `xmlns` of the request, so
+    // keying off xmlns alone would never fire and every upload would stall
+    // until the 15 s "Timeout waiting for media connection".
+    this._pendingIqs.set(mcId, (resp) => {
+      this._onMediaConnectionResult(resp);
+    });
+    // Don't leak the handler if the server never answers.
+    setTimeout(() => this._pendingIqs.delete(mcId), 20000);
+    this._socket.sendNode(new BinaryNode('iq', {
+      id:    mcId,
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'w:m'
+    }, [new BinaryNode('media_conn', {}, null)]));
+  }
+
+  _onMediaConnectionResult(node) {
+    const connNode = findChild(node, 'media_conn');
+    if (!connNode) {
+      // Server answered but refused (or the IQ handler timed out and passed
+      // nothing).  Surface it so the waiter fails fast with a real reason
+      // instead of sitting out the full media-connection timeout.
+      const reason = (node && node.attrs && node.attrs.type === 'error')
+        ? ('server returned IQ error' + (node.attrs.code ? ' ' + node.attrs.code : ''))
+        : 'no media_conn node in server reply';
+      _whaDbg('[DBG] media_conn failed: ' + reason);
+      this.emit('media_conn_error', new Boom('Media connection refused: ' + reason, { statusCode: 502 }));
+      return;
+    }
+    const auth  = (connNode.attrs && connNode.attrs.auth) || '';
+    const ttl   = connNode.attrs && connNode.attrs.ttl ? parseInt(connNode.attrs.ttl, 10) : 300;
+    const hosts = [];
+    if (Array.isArray(connNode.content)) {
+      for (const child of connNode.content) {
+        if (child && child.description === 'host') {
+          const hostname = child.attrs && child.attrs.hostname;
+          if (hostname) hosts.push(hostname);
+        }
+      }
+    }
+    this._mediaConn = { hosts, auth, ttl, fetchDate: Date.now() };
+    if (this._sender) this._sender.setMediaConnection(hosts, auth, ttl, Date.now());
+    this.emit('media_conn', { hosts, auth, ttl });
+  }
+
+  // ─── Pre-key upload ───────────────────────────────────────────────────────
+
+  // Send the server a batch of one-time keys, plus the identity and signed
+  // pre-key that go with them.
+  //
+  // The batch is the next `count` ids the server has not been sent — not the
+  // whole local pool, which is what this used to send. Eight hundred keys went
+  // up on every login and every top-up, the same eight hundred each time, and
+  // the ids the server had already been given were sent again while the ones
+  // generated since were not.
+  //
+  // Awaited, and retried, because it is the one message whose loss is silent:
+  // an upload that never lands leaves the server with nothing to hand out and
+  // the account unreachable, with no error anywhere to say so.
+  //
+  // @returns {Promise<boolean>} whether the server acknowledged it
+  async _uploadPreKeys(count) {
+    if (!this._signal || !this._socket || !this._connected) return false;
+    count = count > 0 ? count : MIN_PREKEY_COUNT;
+
+    const { preKeys, update } = this._signal.getNextPreKeys(count);
+    const spk      = this._signal.getSignedPreKeyForUpload();
+    const identKey = this._signal.getIdentityKey();
+    if (!preKeys.length || !spk) return false;
+
+    const children = [
+      new BinaryNode('registration', {}, intToBytes(this._store.registrationId, 4)),
+      new BinaryNode('type',         {}, Buffer.from([5])),
+      new BinaryNode('identity',     {}, stripKeyPrefix(identKey)),
+      new BinaryNode('list',         {}, preKeys.map(pk => new BinaryNode('key', {}, [
+        new BinaryNode('id',    {}, intToBytes(pk.keyId, 3)),
+        new BinaryNode('value', {}, stripKeyPrefix(pk.pubKey))
+      ]))),
+      new BinaryNode('skey', {}, [
+        new BinaryNode('id',        {}, intToBytes(spk.keyId, 3)),
+        new BinaryNode('value',     {}, stripKeyPrefix(spk.keyPair.pubKey)),
+        new BinaryNode('signature', {}, spk.signature)
+      ])
+    ];
+
+    for (let attempt = 0; attempt < PRE_KEY_UPLOAD_TRIES; attempt++) {
+      if (!this._socket || !this._connected) break;
+
+      const pkId = this._genMsgId();
+      _whaDbg('[DBG] SEND uploadPreKeys IQ id=' + pkId + ' count=' + preKeys.length +
+        ' ids=' + preKeys[0].keyId + '..' + preKeys[preKeys.length - 1].keyId +
+        (attempt ? ' (retry ' + attempt + ')' : ''));
+
+      let resp = null;
+      try {
+        resp = await this._sendIq(new BinaryNode('iq', {
+          id:    pkId,
+          to:    's.whatsapp.net',
+          type:  'set',
+          xmlns: 'encrypt'
+        }, children));
+      } catch (err) {
+        _whaDbg('[DBG] PREKEY upload send failed: ' + (err && err.message));
+      }
+
+      if (resp && !(resp.attrs && resp.attrs.type === 'error')) {
+        // Only now. The keys themselves were spent the moment they were
+        // generated — an id is never handed out twice — but a batch the server
+        // did not take is a batch that still has to go, so the range stays
+        // unuploaded until it is acknowledged.
+        this._signal.commitPreKeyUpload(update);
+        _whaDbg('[DBG] PREKEY uploaded ' + preKeys.length + ' key(s)');
+        return true;
+      }
+
+      if (attempt < PRE_KEY_UPLOAD_TRIES - 1) {
+        await new Promise(r => setTimeout(r, PRE_KEY_UPLOAD_BACKOFF(attempt)));
+      }
+    }
+
+    _whaDbg('[DBG] PREKEY upload gave up after ' + PRE_KEY_UPLOAD_TRIES + ' attempt(s)');
+    return false;
+  }
+
+  // How many one-time keys the server is still holding for us.
+  //
+  // This is the number that matters and the one we could not see. The local
+  // store only loses a key when a pkmsg using it is actually decrypted, while
+  // the server hands one out to everybody who asks for a bundle — including the
+  // ones who then never write. So the two drift apart, and the local count can
+  // sit at its full 800 while the server has none left. With none left nobody
+  // can open a session with this account at all: the messages are not delayed,
+  // they are never sent, which is why nothing arrives and nothing is queued.
+  //
+  // The two client families ask differently, so each is asked its own way. A
+  // companion asks for a count and is told a number. A primary asks for the
+  // digest and is given the ids it holds, which is the same answer with the
+  // arithmetic left to us.
+  async _queryServerPreKeyCount() {
+    if (!this._socket || !this._connected) return null;
+
+    const web  = this._mode === 'web';
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'encrypt'
+    }, [new BinaryNode(web ? 'count' : 'digest', {}, null)]));
+
+    if (!resp) return null;                                   // timed out
+    if (resp.attrs && resp.attrs.type === 'error') return null;
+
+    if (web) {
+      const countNode = findChild(resp, 'count');
+      const value     = countNode && countNode.attrs && countNode.attrs.value;
+      const n         = value === undefined ? NaN : Number(value);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    // <digest><list><...one child per key we still have there...></list></digest>
+    const digest = findChild(resp, 'digest');
+    const list   = digest && findChild(digest, 'list');
+    if (!list) return null;
+    return Array.isArray(list.content) ? list.content.length : 0;
+  }
+
+  // What the server believes this account's key bundle is.
+  //
+  // The digest is the only way to see it. Everything else here is a guess about
+  // what was uploaded once and assumed to have stuck — and when the server's
+  // idea of the bundle and ours part company, nobody can open a session with
+  // this account and there is no error anywhere to say so. It is the state that
+  // registering the number again clears, which is why registering again is what
+  // has been fixing it.
+  async _queryKeyDigest() {
+    if (!this._socket || !this._connected) return null;
+
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'encrypt'
+    }, [new BinaryNode('digest', {}, null)]));
+
+    if (!resp) return null;
+    if (resp.attrs && resp.attrs.type === 'error') return null;
+
+    const digest = findChild(resp, 'digest');
+    if (!digest) return { missing: true };
+
+    const bytesOf = (parent, tag) => {
+      const n = parent && findChild(parent, tag);
+      if (!n) return null;
+      if (Buffer.isBuffer(n.content)) return n.content;
+      return n.content ? Buffer.from(n.content) : null;
+    };
+
+    const skey = findChild(digest, 'skey');
+    const list = findChild(digest, 'list');
+    return {
+      missing:    false,
+      identity:   bytesOf(digest, 'identity'),
+      skeyId:     bytesOf(skey, 'id'),
+      skeyValue:  bytesOf(skey, 'value'),
+      preKeyCount: list && Array.isArray(list.content) ? list.content.length : 0
+    };
+  }
+
+  // Compare that bundle against the one we hold, and re-upload when they differ.
+  //
+  // Only values the server states outright are compared — the identity key and
+  // the signed pre-key it is serving — so nothing here depends on guessing how
+  // it hashes them. A mismatch means the bundle other people are handed is not
+  // the one this session can answer for, and no amount of waiting fixes that.
+  //
+  // Shares _preKeyMutex with _ensureServerPreKeys: both end in the same
+  // replenish-and-upload, so protecting only one of them would leave the same
+  // double upload reachable through the other.
+  async _verifyServerKeyBundle(reason) {
+    if (!this._signal) return;
+    return this._preKeyMutex.runExclusive(() => this._verifyServerKeyBundleLocked(reason));
+  }
+
+  async _verifyServerKeyBundleLocked(reason) {
+    // Re-checked inside the lock: the session can be released while a caller
+    // is still waiting its turn.
+    if (!this._signal) return;
+    try {
+      const digest = await this._queryKeyDigest();
+      if (!digest) return;                       // no answer; nothing to conclude
+
+      if (digest.missing) {
+        _whaDbg('[DBG] KEYBUNDLE server returned no digest (' + reason + ') — re-uploading');
+        await this._uploadPreKeys(INITIAL_PREKEY_COUNT);
+        return;
+      }
+
+      const bare      = (b) => (b && b.length === 33 && b[0] === 0x05) ? b.slice(1) : b;
+      const ourIdent  = bare(this._signal.getIdentityKey());
+      const ourSpk    = this._signal.getSignedPreKeyForUpload();
+      const ourSpkPub = ourSpk && bare(ourSpk.keyPair.pubKey);
+
+      const mismatches = [];
+      if (digest.identity && ourIdent &&
+          Buffer.compare(digest.identity, ourIdent) !== 0) {
+        mismatches.push('identity key');
+      }
+      if (digest.skeyValue && ourSpkPub &&
+          Buffer.compare(digest.skeyValue, ourSpkPub) !== 0) {
+        mismatches.push('signed pre-key');
+      }
+      if (digest.skeyId && ourSpk) {
+        let served = 0;
+        for (const b of digest.skeyId) served = (served << 8) | b;
+        if (served !== ourSpk.keyId) mismatches.push('signed pre-key id (' + served +
+          ' vs ' + ourSpk.keyId + ')');
+      }
+
+      if (!mismatches.length) {
+        _whaDbg('[DBG] KEYBUNDLE matches the server (' + reason + '), ' +
+          digest.preKeyCount + ' one-time key(s) there');
+        return;
+      }
+
+      _whaDbg('[DBG] KEYBUNDLE server disagrees on ' + mismatches.join(' and ') +
+        ' (' + reason + ') — re-uploading');
+      // What is wrong here is the identity or the signed pre-key, and both ride
+      // along with any batch, however small. The one-time pool was settled a
+      // moment ago by _ensureServerPreKeys.
+      await this._uploadPreKeys(MIN_PREKEY_COUNT);
+    } catch (err) {
+      _whaDbg('[DBG] KEYBUNDLE check failed (' + reason + '): ' + (err && err.message));
+    }
+  }
+
+  // Top the server back up when it is running out. Never throws: a session that
+  // cannot ask is left exactly as it was rather than losing its connection over
+  // a bookkeeping query.
+  //
+  // Runs one at a time — see _preKeyMutex in the constructor.
+  async _ensureServerPreKeys(reason) {
+    if (!this._signal) return;
+    return this._preKeyMutex.runExclusive(() => this._ensureServerPreKeysLocked(reason));
+  }
+
+  async _ensureServerPreKeysLocked(reason) {
+    if (!this._signal) return;
+    try {
+      const serverCount = await this._queryServerPreKeyCount();
+
+      // How big a batch this warrants. A server holding none of ours has either
+      // never had them or has handed every one out, and either way the account
+      // is unreachable until a full pool is back up there; anything else is a
+      // top-up. A session that has never uploaded counts as the first case even
+      // when the server says it has some, because whatever it is holding did
+      // not come from here.
+      const neverUploaded = this._signal.firstUnuploadedPreKeyId() <= 1;
+      const count = (serverCount === 0 || neverUploaded)
+        ? INITIAL_PREKEY_COUNT : MIN_PREKEY_COUNT;
+
+      if (serverCount === null) {
+        // No usable answer. Upload anyway — one we may not have needed costs
+        // nothing next to an account nobody can reach.
+        _whaDbg('[DBG] PREKEY server count unavailable (' + reason + ') — uploading anyway');
+        await this._uploadPreKeys(count);
+        return;
+      }
+
+      // The newest key we generated. If it is not in the pool the store has
+      // lost keys the server may still be serving, and the bundle needs
+      // rebuilding whatever the count says.
+      const currentId      = this._signal.currentPreKeyId();
+      const missingCurrent = currentId > 0 && !this._signal.hasPreKey(currentId);
+      const lowServer      = serverCount <= count;
+
+      _whaDbg('[DBG] PREKEY server holds ' + serverCount + ' (' + reason +
+        '), current id ' + currentId + (missingCurrent ? ' MISSING' : ' present'));
+
+      if (!lowServer && !missingCurrent) return;
+
+      const why = [];
+      if (lowServer)      why.push('server count low (' + serverCount + ')');
+      if (missingCurrent) why.push('current pre-key ' + currentId + ' missing from storage');
+      _whaDbg('[DBG] PREKEY uploading ' + count + ' due to: ' + why.join(', '));
+
+      await this._uploadPreKeys(count);
+    } catch (err) {
+      _whaDbg('[DBG] PREKEY check failed (' + reason + '): ' + (err && err.message));
+    }
+  }
+
+  _checkAndReplenishPreKeys() {
+    if (!this._signal) return;
+    // The server said it is running low, so ask it how low and act on that
+    // rather than on the local count, which does not move when the server
+    // hands a key out.
+    this._ensureServerPreKeys('server asked');
+  }
+
+  // Outstanding resend requests, with an hour's memory and a ceiling.
+  //
+  // A plain Map would hold every id the session ever failed to decrypt. The TTL
+  // is what the reference client uses; the ceiling is what keeps a burst of
+  // undecryptable stanzas from growing it without bound, dropping the oldest
+  // entries first — the ones whose request has already timed out anyway.
+  get _placeholderResendCache() {
+    const map = this.__placeholderResend;
+    const now = Date.now();
+    return {
+      has: (id) => {
+        const e = map.get(id);
+        if (!e) return false;
+        if (Date.now() - e.at > PLACEHOLDER_TTL_MS) { map.delete(id); return false; }
+        return true;
+      },
+      get: (id) => {
+        const e = map.get(id);
+        if (!e) return undefined;
+        if (Date.now() - e.at > PLACEHOLDER_TTL_MS) { map.delete(id); return undefined; }
+        return e.value;
+      },
+      set: (id, value) => {
+        map.set(id, { value, at: now });
+        // Map keeps insertion order, so the first key is the oldest.
+        while (map.size > PLACEHOLDER_MAX) map.delete(map.keys().next().value);
+      },
+      delete: (id) => map.delete(id),
+      get size() { return map.size; }
+    };
+  }
+
+  // ─── Peer data operations, and asking the phone to resend ─────────────────
+  //
+  // A peer-data-operation request is how a companion asks its own phone for
+  // something. It goes out as a ProtocolMessage addressed to this account, with
+  // the stanza marked category="peer" so the server routes it to the other
+  // devices instead of delivering it as a chat message to yourself.
+  //
+  // @param {object} pdo  see encodePeerDataOperationRequestMessage
+  // @returns {Promise<string>} the id of the message that carried the request
+  async sendPeerDataOperationMessage(pdo) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    const me = this._store && this._store.me && this._store.me.id;
+    if (!me) throw new Boom('Not authenticated', { statusCode: 401 });
+
+    const {
+      encodeMessage, encodeProtocolMessage,
+      encodePeerDataOperationRequestMessage,
+      PROTOCOL_TYPE_PEER_DATA_OPERATION_REQUEST
+    } = require('./proto/MessageProto');
+
+    const payload = encodeProtocolMessage({
+      type: PROTOCOL_TYPE_PEER_DATA_OPERATION_REQUEST,
+      peerDataOperationRequestMessage: encodePeerDataOperationRequestMessage(pdo)
+    });
+    const msgBuf = encodeMessage('protocol', payload);
+    const msgId  = this._genMsgId();
+
+    await this._sender._sendMessage(String(me), msgId, msgBuf, 'text', {
+      _protocol:      true,           // not a reach-out; keeps it off the tcToken gate
+      _noRecord:      true,           // bookkeeping between our devices, not a chat message
+      category:       'peer',
+      pushPriority:   'high_force',
+      additionalNodes: [new BinaryNode('meta', { appdata: 'default' }, null)]
+    });
+    return msgId;
+  }
+
+  /**
+   * Ask the phone to send a message again.
+   *
+   * A message that cannot be decrypted — a session that moved on, a key that
+   * was already spent — is gone as far as this device is concerned. The phone
+   * still has the plaintext, so the fix is to ask it, not to retry the
+   * ciphertext.
+   *
+   * The cache is what stops that turning into a storm. One request per message
+   * id, and the entry is what says a request is outstanding:
+   *
+   *   • already asked            → say nothing, return
+   *   • it arrives within 2s     → the entry is gone, answer 'RESOLVED'
+   *   • no answer after 8s       → drop the entry so a later attempt may ask
+   *
+   * @param {{remoteJid: string, fromMe: boolean, id: string}} messageKey
+   * @param {object} [msgData]  metadata to keep for whatever handles the reply
+   * @returns {Promise<string|undefined|'RESOLVED'>}
+   */
+  async requestPlaceholderResend(messageKey, msgData) {
+    if (!messageKey || !messageKey.id) return;
+    const me = this._store && this._store.me && this._store.me.id;
+    if (!me) throw new Boom('Not authenticated', { statusCode: 401 });
+
+    const cache = this._placeholderResendCache;
+    if (cache.has(messageKey.id)) {
+      _whaDbg('[DBG] PLACEHOLDER already requested for ' + messageKey.id);
+      return;
+    }
+    cache.set(messageKey.id, msgData || true);
+
+    // Give it a moment. Most of these resolve on their own — the message that
+    // failed to decrypt is very often followed by the sender's own retry.
+    await new Promise(r => setTimeout(r, PLACEHOLDER_SETTLE_MS));
+    if (!cache.has(messageKey.id)) {
+      _whaDbg('[DBG] PLACEHOLDER ' + messageKey.id + ' arrived before asking');
+      return 'RESOLVED';
+    }
+
+    // The phone may simply be off. Let the entry go so this is not the last
+    // word on the subject.
+    setTimeout(() => {
+      if (cache.has(messageKey.id)) {
+        _whaDbg('[DBG] PLACEHOLDER no answer for ' + messageKey.id + ' — phone likely offline');
+        cache.delete(messageKey.id);
+      }
+    }, PLACEHOLDER_TIMEOUT_MS).unref?.();
+
+    const { PeerDataOperationRequestType } = require('./proto/MessageProto');
+    _whaDbg('[DBG] PLACEHOLDER requesting resend of ' + messageKey.id);
+    return this.sendPeerDataOperationMessage({
+      peerDataOperationRequestType: PeerDataOperationRequestType.PLACEHOLDER_MESSAGE_RESEND,
+      placeholderMessageResendRequest: [{ messageKey }]
+    });
+  }
+
+  /**
+   * Ask the phone for older messages in a chat.
+   *
+   * The same channel, a different operation — this is what an on-demand
+   * history sync is built on.
+   */
+  async fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestampMs) {
+    const { PeerDataOperationRequestType } = require('./proto/MessageProto');
+    return this.sendPeerDataOperationMessage({
+      peerDataOperationRequestType: PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND,
+      historySyncOnDemandRequest: {
+        chatJid:              oldestMsgKey.remoteJid,
+        oldestMsgId:          oldestMsgKey.id,
+        oldestMsgFromMe:      !!oldestMsgKey.fromMe,
+        onDemandMsgCount:     count,
+        oldestMsgTimestampMs: oldestMsgTimestampMs
+      }
+    });
+  }
+
+  /** Note that a message we asked about has turned up, so nothing is owed. */
+  _resolvePlaceholderResend(msgId) {
+    if (msgId && this._placeholderResendCache.has(msgId)) {
+      this._placeholderResendCache.delete(msgId);
+      _whaDbg('[DBG] PLACEHOLDER resolved ' + msgId);
+    }
+  }
+
+  // ─── WAM — the stats channel WhatsApp Web reports on ──────────────────────
+  //
+  // A WAM buffer is a batch of telemetry events encoded in WhatsApp's own
+  // binary format and posted to `w:stats`. The web client sends these
+  // constantly; a companion session that never does is one more thing that
+  // distinguishes it from a browser.
+  //
+  // Nothing here fires on its own, and that matches the reference client's
+  // library exactly — it builds the same three pieces, exposes the same
+  // `wamBuffer` and the same `sendWAMBuffer`, and never calls the latter
+  // itself. What to report, and when, is the application's decision.
+  //
+  //   const { WAM } = require('whalibmob')
+  //
+  //   client.wamBuffer.sequence = 1
+  //   client.wamBuffer.events = [{
+  //     WamDroppedEvent: {
+  //       props:   { droppedEventCode: 3, droppedEventCount: 1, isFromWamsys: true },
+  //       globals: {}
+  //     }
+  //   }]
+  //   await client.sendWAMBuffer(WAM.encodeWAM(client.wamBuffer))
+  //
+  // The event and field names come from WAM.WEB_EVENTS and WAM.WEB_GLOBALS,
+  // which are the reference client's tables verbatim.
+
+  /** The buffer an application fills in before encoding. */
+  get wamBuffer() {
+    if (!this._wamBuffer) {
+      const { BinaryInfo } = require('./WAM');
+      this._wamBuffer = new BinaryInfo();
+    }
+    return this._wamBuffer;
+  }
+
+  /**
+   * Post an encoded WAM buffer to the server.
+   *
+   * @param   {Buffer} wamBuffer  output of WAM.encodeWAM()
+   * @returns {Promise<object|null>}  the server's IQ result, or null on timeout
+   */
+  async sendWAMBuffer(wamBuffer) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (!Buffer.isBuffer(wamBuffer)) {
+      throw new Boom('sendWAMBuffer expects a Buffer from WAM.encodeWAM()', { statusCode: 400 });
+    }
+    return this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      xmlns: 'w:stats'
+    }, [
+      new BinaryNode('add', { t: String(Math.round(Date.now() / 1000)) }, wamBuffer)
+    ]));
+  }
+
+  // ─── IQ helper (send + await response) ────────────────────────────────────
+
+  _sendIq(node, opts = {}) {
+    return new Promise((resolve, reject) => {
+      const id = node.attrs && node.attrs.id;
+      if (!id) return reject(new Boom('IQ node has no id', { statusCode: 400 }));
+
+      const timeoutMs = opts.timeoutMs === undefined ? 15000 : opts.timeoutMs;
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 120000) {
+        return reject(new Boom('Invalid IQ response timeout', { statusCode: 400 }));
+      }
+      const noReply = (code) => {
+        if (!opts.rejectOnNoReply) return resolve(null);
+        const error = new Boom(code === 'IQ_TIMEOUT'
+          ? 'IQ response deadline exceeded' : 'Connection closed before IQ response',
+          { statusCode: code === 'IQ_TIMEOUT' ? 408 : 428 });
+        error.code = code;
+        reject(error);
+      };
+
+      const timer = setTimeout(() => {
+        this._pendingIqs.delete(id);
+        noReply('IQ_TIMEOUT');
+      }, timeoutMs);
+
+      this._pendingIqs.set(id, (result) => {
+        clearTimeout(timer);
+        // _onClose resolves pending requests with null. Preserve that contract
+        // for existing callers, but let opted-in methods distinguish it from
+        // a deadline. Neither outcome means a mutation was rejected.
+        this._pendingIqs.delete(id);
+        if (result === null) return noReply('IQ_DISCONNECTED');
+        resolve(result);
+      });
+
+      try {
+        this._socket.sendNode(node);
+      } catch (err) {
+        clearTimeout(timer);
+        this._pendingIqs.delete(id);
+        reject(err);
+      }
+    });
+  }
+
+  // ─── Group metadata ───────────────────────────────────────────────────────
+
+  // ─── Group metadata parser (shared by getGroupMetadata + fetchAllGroups) ──
+
+  _parseGroupNode(groupNode) {
+    if (!groupNode || !groupNode.attrs) return null;
+    const a = groupNode.attrs;
+    const children = Array.isArray(groupNode.content) ? groupNode.content : [];
+
+    // participants — normalize jid to string (BinaryNode may yield an object)
+    // Also parse phone_number and lid attributes used for LID↔PN mapping
+    const participants = children
+      .filter(n => n && n.description === 'participant' && n.attrs && n.attrs.jid)
+      .map(n => {
+        const pJid  = String(n.attrs.jid);
+        const pRole = n.attrs.type || 'member';
+        const pPhone = n.attrs.phone_number ? String(n.attrs.phone_number) : null;
+        const pLid   = n.attrs.lid          ? String(n.attrs.lid)          : null;
+        // Populate LID↔PN maps from participant attributes
+        // Case A: participant JID is a LID, phone_number is their PN
+        if (pJid.endsWith('@lid')) {
+          const lidUser = pJid.split('@')[0].split(':')[0];
+          if (pPhone) {
+            const pnUser = pPhone.split('@')[0].split(':')[0];
+            this._lidToPn.set(lidUser, pnUser);
+            this._pnToLid.set(pnUser, lidUser);
+            if (this._signal && this._signal.store && this._signal.store.setLidMapping)
+              this._signal.store.setLidMapping(pnUser, lidUser);
+          }
+        }
+        // Case B: participant JID is a PN, lid attribute is their LID
+        if (pLid && pLid.endsWith('@lid')) {
+          const pnUser  = pJid.split('@')[0].split(':')[0];
+          const lidUser = pLid.split('@')[0].split(':')[0];
+          this._lidToPn.set(lidUser, pnUser);
+          this._pnToLid.set(pnUser, lidUser);
+          if (this._signal && this._signal.store && this._signal.store.setLidMapping)
+            this._signal.store.setLidMapping(pnUser, lidUser);
+        }
+        return {
+          jid:  pJid,
+          role: pRole,
+          // Both address families, whichever way round the server named them,
+          // so a caller does not have to reach into the LID maps to find out
+          // who a participant is.
+          phoneNumber:  pJid.endsWith('@lid') ? pPhone : pJid,
+          lid:          pJid.endsWith('@lid') ? pJid   : pLid,
+          displayName:  n.attrs.display_name ? String(n.attrs.display_name) : null,
+          username:     n.attrs.participant_username ? String(n.attrs.participant_username)
+                      : n.attrs.username ? String(n.attrs.username) : null,
+          isAdmin:      pRole === 'admin' || pRole === 'superadmin',
+          isSuperAdmin: pRole === 'superadmin'
+        };
+      });
+
+    // description — the id is the "topic id" the server wants echoed back as
+    // prev= on the next edit, so it has to survive the parse.
+    const descNode = children.find(n => n && n.description === 'description');
+    const descriptionId = (descNode && descNode.attrs && descNode.attrs.id)
+      ? String(descNode.attrs.id) : null;
+    let description = null;
+    if (descNode) {
+      const bodyNode = Array.isArray(descNode.content)
+        ? descNode.content.find(n => n && n.description === 'body')
+        : null;
+      const buf = bodyNode && (Buffer.isBuffer(bodyNode.content)
+        ? bodyNode.content
+        : (Array.isArray(bodyNode.content) && Buffer.isBuffer(bodyNode.content[0])
+          ? bodyNode.content[0] : null));
+      if (buf) description = buf.toString('utf8');
+    }
+
+    const descriptionBy = (descNode && descNode.attrs && descNode.attrs.participant)
+      ? toNonAdJid(String(descNode.attrs.participant)) : null;
+    const descriptionByPn = (descNode && descNode.attrs && descNode.attrs.participant_pn)
+      ? toNonAdJid(String(descNode.attrs.participant_pn)) : null;
+    const descriptionTime = (descNode && descNode.attrs)
+      ? parseInt(descNode.attrs.t, 10) || 0 : 0;
+
+    // ephemeral
+    const ephNode = children.find(n => n && n.description === 'ephemeral');
+    const ephemeral = ephNode && ephNode.attrs ? parseInt(ephNode.attrs.expiration, 10) || 0 : 0;
+
+    // settings flags — WA protocol uses 'announcement' and 'locked' node names
+    const announce = children.some(n => n && n.description === 'announcement');
+    const restrict = children.some(n => n && n.description === 'locked');
+
+    // The rest of the flags the server reports. These used to be dropped, which
+    // meant a group's join-approval and member-add settings could be written but
+    // never read back — changing one and then asking for the metadata reported
+    // nothing at all about it.
+    const joinApprovalMode = children.some(n => n && n.description === 'membership_approval_mode');
+    const parentNode       = children.find(n => n && n.description === 'parent');
+    const linkedParentNode = children.find(n => n && n.description === 'linked_parent');
+    const memberAddNode    = children.find(n => n && n.description === 'member_add_mode');
+    const memberAddBuf     = memberAddNode ? getNodeContent(memberAddNode) : null;
+    const memberAddMode    = memberAddBuf ? memberAddBuf.toString('utf8') : null;
+    // An incognito group hides members' phone numbers from each other, and a
+    // suspended one has been taken down — both are things a caller has to be
+    // able to see rather than discover by having every send refused.
+    const isIncognito      = children.some(n => n && n.description === 'incognito');
+    const isSuspended      = children.some(n => n && n.description === 'suspended');
+
+    const groupId = a.id || '';
+    const jid = groupId.includes('@') ? groupId : groupId + '@g.us';
+
+    // addressing_mode: 'lid' (modern groups) or 'pn' (legacy groups)
+    const addressingMode = (a.addressing_mode === 'pn') ? 'pn' : 'lid';
+
+    // update member cache and addressing mode
+    this._groupMembers.set(jid, new Set(participants.map(p => p.jid)));
+    this._groupAddressingMode.set(jid, addressingMode);
+
+    const meta = {
+      jid,
+      subject:    a.subject || '',
+      creation:   parseInt(a.creation, 10) || 0,
+      creator:    a.creator || null,
+      subjectTime: parseInt(a.s_t, 10) || 0,
+      subjectBy:  a.s_o || null,
+      description,
+      descriptionId,
+      descriptionBy,
+      descriptionByPn,
+      descriptionTime,
+      ephemeral,
+      onlyAdminsSend: announce,
+      onlyAdminsEdit: restrict,
+      // Whether new members have to be waved through by an admin.
+      joinApprovalMode,
+      // 'admin_add' | 'all_member_add' | null when the server did not say.
+      memberAddMode,
+      // A community's own node, and the community a plain group belongs to.
+      isCommunity: !!parentNode,
+      // How a community waves its incoming sub-group members through by default.
+      defaultMembershipApprovalMode:
+        (parentNode && parentNode.attrs && parentNode.attrs.default_membership_approval_mode)
+          ? String(parentNode.attrs.default_membership_approval_mode) : null,
+      isCommunityAnnounce: children.some(n => n && n.description === 'default_sub_group'),
+      linkedParent: (linkedParentNode && linkedParentNode.attrs && linkedParentNode.attrs.jid)
+        ? String(linkedParentNode.attrs.jid) : null,
+      isIncognito,
+      isSuspended,
+      // The phone-number and username forms of the two people named in the
+      // header, when the server sends them alongside the addresses it used.
+      creatorPn:        a.creator_pn ? toNonAdJid(String(a.creator_pn)) : null,
+      creatorUsername:  a.creator_username || null,
+      creatorCountry:   a.creator_country_code || null,
+      subjectByPn:      a.s_o_pn ? toNonAdJid(String(a.s_o_pn)) : null,
+      subjectByUsername: a.s_o_username || null,
+      notify:           a.notify || null,
+      // Version stamps the server bumps whenever the participant list or the
+      // announce flag changes; a cache can compare them instead of re-reading.
+      participantVersion: a.p_v_id || null,
+      announceVersion:    a.a_v_id || null,
+      // The server's own count, which can exceed the participant list it sent.
+      size: a.size ? parseInt(a.size, 10) || participants.length : participants.length,
+      addressingMode,
+      participants
+    };
+
+    // Warm the cache from every parse — fetchAllGroups() then primes metadata
+    // for every group at once, so the first send to any of them skips its IQ.
+    if (this._groupMetaCache) this._groupMetaCache.set(jid, meta);
+    return meta;
+  }
+
+  // Query metadata for a single group — returns parsed object.
+  // Served from cache when available; pass { force: true } to bypass it.
+  async getGroupMetadata(groupJid, opts) {
+    const jid = makeJid(groupJid);
+
+    if (!opts || !opts.force) {
+      const cached = this._groupMetaCache.get(jid);
+      if (cached) {
+        _whaDbg('[DBG] GROUP_META cache hit ' + jid);
+        // Re-seed the member/addressing maps — a reconnect clears them while
+        // the metadata cache is still warm.
+        this._groupMembers.set(jid, new Set(cached.participants.map(p => p.jid)));
+        this._groupAddressingMode.set(jid, cached.addressingMode);
+        return cached;
+      }
+      // Coalesce concurrent lookups for the same group onto one IQ.
+      const inflight = this._groupMetaInflight.get(jid);
+      if (inflight) {
+        _whaDbg('[DBG] GROUP_META joining in-flight query for ' + jid);
+        return inflight;
+      }
+    }
+
+    const promise = (async () => {
+      const id   = this._genMsgId();
+      const node = new BinaryNode('iq', {
+        id,
+        to:    jid,
+        type:  'get',
+        xmlns: 'w:g2'
+      }, [new BinaryNode('query', { request: 'interactive' }, null)]);
+
+      const response = await this._sendIq(node);
+      if (!response) return null;
+
+      // Response may be the group node itself or wrap it
+      const groupNode = (response.description === 'group')
+        ? response
+        : findChild(response, 'group');
+      const meta = this._parseGroupNode(groupNode);
+      if (meta) this._groupMetaCache.set(jid, meta);
+      return meta;
+    })();
+
+    this._groupMetaInflight.set(jid, promise);
+    try {
+      return await promise;
+    } finally {
+      this._groupMetaInflight.delete(jid);
+    }
+  }
+
+  // Drop cached metadata for a group so the next read re-queries the server.
+  invalidateGroupMetadata(groupJid) {
+    const jid = makeJid(groupJid);
+    this._groupMetaCache.del(jid);
+    this._groupMetaInflight.delete(jid);
+    _whaDbg('[DBG] GROUP_META invalidated ' + jid);
+  }
+
+  // Fetch ALL groups the connected account participates in
+  // Returns array of parsed group metadata objects (same shape as getGroupMetadata)
+  // Protocol: IQ w:g2 to=g.us type=get <participating><participants/><description/></participating>
+  async fetchAllGroups() {
+    const id   = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      to:    'g.us',
+      type:  'get',
+      xmlns: 'w:g2'
+    }, [
+      new BinaryNode('participating', {}, [
+        new BinaryNode('participants',  {}, null),
+        new BinaryNode('description',   {}, null)
+      ])
+    ]);
+
+    const response = await this._sendIq(node);
+    if (!response) {
+      throw new Boom('fetchAllGroups: no reply from server (IQ timed out)', { statusCode: 408 });
+    }
+    if (response.attrs && response.attrs.type === 'error') {
+      const errNode = findChild(response, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('fetchAllGroups: server returned error' + (code ? ' ' + code : ''), { statusCode: statusFrom(code) });
+    }
+
+    // The server wraps the list in a <groups> node: iq > groups > group[].
+    // Fall back to scanning the iq body directly in case a server build ever
+    // returns them unwrapped.
+    const groupsNode = findChild(response, 'groups');
+    const container  = groupsNode || response;
+    const children   = Array.isArray(container.content) ? container.content : [];
+    return children
+      .filter(n => n && n.description === 'group')
+      .map(n => this._parseGroupNode(n))
+      .filter(Boolean);
+  }
+
+  // ─── Group member helpers ─────────────────────────────────────────────────
+
+  _getGroupMembers(groupJid) {
+    const members = this._groupMembers.get(makeJid(groupJid));
+    return members ? [...members] : [];
+  }
+
+  async refreshGroupMembers(groupJid) {
+    const meta = await this.getGroupMetadata(groupJid);
+    return meta ? meta.participants : [];
+  }
+
+  getPNForLID(lid) {
+    const lidUser = String(lid).split('@')[0].split(':')[0];
+    const pnUser  = this._lidToPn.get(lidUser);
+    return pnUser ? pnUser + '@s.whatsapp.net' : null;
+  }
+
+  getLIDForPN(pn) {
+    const pnUser  = String(pn).split('@')[0].split(':')[0];
+    const lidUser = this._pnToLid.get(pnUser);
+    return lidUser ? lidUser + '@lid' : null;
+  }
+
+  // ─── Message ID generator ─────────────────────────────────────────────────
+
+  _genMsgId() {
+    return crypto.randomBytes(8).toString('hex').toUpperCase();
+  }
+
+  // ─── tcToken / privacy token helpers ──────────────────────────────────────
+
+  /**
+   * Send a `<iq type='set' xmlns='privacy'>` to issue a trusted-contact token
+   * for `jid`. Returns the raw result node (or null on timeout).
+   *
+   * @param {string} jid          - Bare or full JID of the conversation partner
+   * @param {number} timestamp    - Unix seconds to use as the token timestamp
+   */
+  _issuePrivacyTokens(jid, timestamp) {
+    const { normalizeJidForTcToken } = require('./messages/TcTokenStore');
+    const normalizedJid = normalizeJidForTcToken(jid);
+    const id            = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'privacy'
+    }, [
+      new BinaryNode('tokens', {}, [
+        new BinaryNode('token', {
+          jid:  normalizedJid,
+          t:    String(timestamp),
+          type: 'trusted_contact'
+        })
+      ])
+    ]);
+    _whaDbg('[DBG] ISSUE_PRIVACY_TOKENS jid=' + normalizedJid + ' t=' + timestamp + ' iq_id=' + id);
+    return this._sendIq(node);
+  }
+
+  /**
+   * Put a trusted-contact token on file *before* the first message to a contact
+   * is built, so that message carries a `<tctoken>` like every later one.
+   *
+   * The token never came from the contact. `_issuePrivacyTokens` is an IQ to
+   * s.whatsapp.net and the server answers with the bytes, so nothing here waits
+   * on the other side replying, having us in their address book, or a
+   * conversation existing at all.
+   *
+   * What was missing was only the ordering. Issuance ran after
+   * `_dispatchAndAck` and fire-and-forget, so the first message to any new
+   * contact went out with no token and the server counted it as an anonymous
+   * reach-out. At bulk that is one such event per number, which is exactly the
+   * fuel for error 463. The official app issues on opening the chat — before
+   * anything is typed — so `issue → send` is the faithful order, not `send →
+   * issue`.
+   *
+   * Three cases return without waiting, and each matters:
+   *
+   *   - a live token is already on file. Renewal is due eventually, but the
+   *     post-send path does that without holding a message up.
+   *   - `shouldIssue` is false. We already asked inside this 7-day bucket and
+   *     the server gave us nothing; asking again now would put a round-trip in
+   *     front of every send for nothing.
+   *   - the JID is the PSA account or a bot, which cannot timelock us.
+   *
+   * @param   {string}  tcJid        storage key, already through _resolveTcTokenJid
+   * @param   {string}  routingToJid the JID the message is addressed to
+   * @returns {Promise<boolean>}     whether a usable token is on file now
+   */
+  async ensureTcTokenBeforeSend(tcJid, routingToJid) {
+    const store = this._tcTokenStore;
+    if (!store) return false;
+
+    const { tcTokenExpired, isRegularTcTokenUser } = require('./messages/TcTokenStore');
+    if (!isRegularTcTokenUser(tcJid)) return false;
+
+    // Never ourselves. A note-to-self is not a reach-out, and holding it up for
+    // a token nobody will check is the one stall this change could introduce.
+    const bare      = String(tcJid).split('@')[0].split(':')[0];
+    const ownPhone  = this._store && this._store.phoneNumber
+      ? String(this._store.phoneNumber) : null;
+    const ownLidUsr = this._myLid ? String(this._myLid).split('@')[0].split(':')[0] : null;
+    if ((ownPhone && bare === ownPhone) || (ownLidUsr && bare === ownLidUsr)) return false;
+
+    const live = entry =>
+      !!(entry && entry.token && entry.token.length && !tcTokenExpired(entry.timestamp));
+
+    if (live(store.get(tcJid))) return true;
+    if (!store.shouldIssue(tcJid)) return false;
+
+    // A second send to the same contact must wait on the first one's answer
+    // rather than issue a competing IQ for the same JID.
+    let pending = this._tcTokenIssuanceWaiters.get(tcJid);
+    if (!pending) {
+      const issueTs  = Math.floor(Date.now() / 1000);
+      const issueJid = this._resolveTcTokenIssuanceJid(routingToJid);
+      _whaDbg('[DBG] TCTOKEN_PRESEND issuing for ' + tcJid + ' (as ' + issueJid + ')');
+      pending = this._issuePrivacyTokens(issueJid, issueTs)
+        .then(result => { this._storeTcTokenFromIqResult(result, tcJid, issueTs); })
+        .catch(err => {
+          _whaDbg('[DBG] TCTOKEN_PRESEND_ERR jid=' + tcJid + ' err=' + (err && err.message));
+        })
+        .finally(() => { this._tcTokenIssuanceWaiters.delete(tcJid); });
+      this._tcTokenIssuanceWaiters.set(tcJid, pending);
+    }
+
+    // Bounded wait. A send is never failed or delayed indefinitely over a token:
+    // past the deadline it goes out without one, the issuance carries on in the
+    // background, and the next message to this contact picks the token up.
+    const limit = this._tcTokenPresendTimeoutMs;
+    if (limit <= 0) return false;
+
+    let timer = null;
+    const deadline = new Promise(resolve => {
+      timer = setTimeout(() => resolve(false), limit);
+    });
+    const finished = await Promise.race([pending.then(() => true), deadline]);
+    if (timer) clearTimeout(timer);
+
+    if (!finished) {
+      _whaDbg('[DBG] TCTOKEN_PRESEND timed out after ' + limit + 'ms jid=' + tcJid +
+        ' — sending without a token');
+      return false;
+    }
+
+    const ok = live(store.get(tcJid));
+    _whaDbg('[DBG] TCTOKEN_PRESEND ' + (ok ? 'ready' : 'no bytes returned') + ' jid=' + tcJid);
+    return ok;
+  }
+
+  /**
+   * Parse the IQ result from `_issuePrivacyTokens` and persist the token.
+   *
+   * The server echoes back:
+   *   <iq type='result' ...>
+   *     <tokens>
+   *       <token type='trusted_contact' jid='X' t='Y'>...bytes...</token>
+   *     </tokens>
+   *   </iq>
+   *
+   * @param {object|null} result        - IQ result node (null on timeout)
+   * @param {string}      fallbackJid   - Normalized JID to use if not found in result
+   * @param {number}      issueTs       - Timestamp supplied to the IQ
+   */
+  _storeTcTokenFromIqResult(result, fallbackJid, issueTs, opts) {
+    const saveSenderTs = !opts || opts.saveSenderTs !== false; // default true
+    if (!this._tcTokenStore) return;
+    const { isRegularTcTokenUser } = require('./messages/TcTokenStore');
+
+    // ── Debug: dump result structure so we can trace server response ─────────
+    if (!result) {
+      _whaDbg('[DBG] STORE_TCTOKEN result=NULL (IQ timeout or not matched) fallback=' + fallbackJid);
+    } else {
+      const contentLen = Array.isArray(result.content) ? result.content.length
+                       : Buffer.isBuffer(result.content) ? result.content.length
+                       : 0;
+      _whaDbg('[DBG] STORE_TCTOKEN result type=' + (result.attrs && result.attrs.type) +
+        ' id=' + (result.attrs && result.attrs.id) +
+        ' contentLen=' + contentLen);
+      if (Array.isArray(result.content)) {
+        result.content.forEach((c, i) => {
+          if (c && c.description) {
+            const childContent = Array.isArray(c.content) ? c.content.length + ' children'
+                               : Buffer.isBuffer(c.content) ? c.content.length + 'B'
+                               : String(c.content);
+            _whaDbg('[DBG] STORE_TCTOKEN   child[' + i + '] tag=' + c.description +
+              ' attrs=' + JSON.stringify(c.attrs || {}) +
+              ' content=' + childContent);
+          }
+        });
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    let tokenStoredCount = 0;
+    if (result) {
+      try {
+        // Find <tokens> child — may be direct child or nested
+        const content = Array.isArray(result.content) ? result.content : [];
+        const tokensNode = content.find(n => n && n.description === 'tokens');
+        const entries    = tokensNode && Array.isArray(tokensNode.content) ? tokensNode.content : [];
+        for (const tokenNode of entries) {
+          if (!tokenNode || tokenNode.description !== 'token') continue;
+          const a = tokenNode.attrs || {};
+          if (a.type !== 'trusted_contact') continue;
+          // bytes: server returns raw binary in node content
+          const bytes = Buffer.isBuffer(tokenNode.content) ? tokenNode.content
+                      : ArrayBuffer.isView(tokenNode.content)
+                        ? Buffer.from(tokenNode.content)
+                        : (typeof tokenNode.content === 'string' && tokenNode.content.length > 0)
+                          ? Buffer.from(tokenNode.content, 'base64')
+                          : null;
+          // In a notification, tokenNode.attrs.jid is our own device JID rather
+          // than the sender's, so fallbackJid wins whenever it is present.
+          const jid = fallbackJid || String(a.jid);
+          const t   = a.t   ? parseInt(String(a.t), 10) : issueTs;
+          // Anything that is not a regular user is dropped here, guarding
+          // against a malformed or spoofed notification filing a token under
+          // the PSA account or a bot.
+          if (!isRegularTcTokenUser(jid)) {
+            _whaDbg('[DBG] STORE_TCTOKEN skipped non-user jid=' + jid);
+            continue;
+          }
+          if (bytes && bytes.length) {
+            // setToken refuses a timestamp-less or older-than-stored token.
+            if (this._tcTokenStore.setToken(jid, bytes, t)) {
+              tokenStoredCount++;
+              _whaDbg('[DBG] TCTOKEN_STORED jid=' + jid + ' t=' + t + ' len=' + bytes.length);
+            } else {
+              _whaDbg('[DBG] STORE_TCTOKEN rejected (no/older timestamp) jid=' + jid + ' t=' + t);
+            }
+          } else {
+            _whaDbg('[DBG] STORE_TCTOKEN token node has no bytes jid=' + jid);
+          }
+        }
+      } catch (e) {
+        _whaDbg('[DBG] STORE_TCTOKEN parse error: ' + e.message);
+      }
+    }
+
+    // ── CRITICAL: senderTimestamp is ALWAYS persisted after issuing,     ─────
+    // ── regardless of whether the server returned token bytes.           ─────
+    // ── Without this, shouldSendNewTcToken() returns true every send and ─────
+    // ── we flood the server with privacy IQs.                            ─────
+    // ── For incoming privacy_token notifications saveSenderTs=false so  ─────
+    // ── we don't overwrite our own send-dedupe timestamp with the peer's ─────
+    // Same user gate as the token itself — no dedupe row for the PSA account
+    // or a bot, since we never issue to them in the first place.
+    if (saveSenderTs && issueTs != null && isRegularTcTokenUser(fallbackJid)) {
+      try {
+        this._tcTokenStore.setSenderTimestamp(fallbackJid, issueTs);
+        _whaDbg('[DBG] SENDER_TS_SAVED jid=' + fallbackJid + ' ts=' + issueTs +
+          ' tokenBytes=' + tokenStoredCount);
+      } catch (_) {}
+    }
+  }
+
+  /**
+   * Handle a server-pushed `<notification type='privacy_token'>`.
+   *
+   * Wire format:
+   *   <notification type='privacy_token' from='...' [sender_lid='...@lid']>
+   *     <tokens>
+   *       <token type='trusted_contact' jid='...' t='...'>…bytes…</token>
+   *     </tokens>
+   *   </notification>
+   *
+   * Key rules:
+   *   1. Must find <tokens> wrapper inside notification; abort if absent.
+   *   2. storage key = sender_lid (if present and @lid) else PN→LID lookup else from-JID.
+   *   3. senderTimestamp is NOT updated here — only the peer-token bytes + timestamp.
+   *
+   * @param {object} node  - The full `<notification>` BinaryNode
+   */
+  _handlePrivacyTokenNotification(node) {
+    if (!this._tcTokenStore) return;
+    const { normalizeJidForTcToken } = require('./messages/TcTokenStore');
+
+    const attrs = node.attrs || {};
+    _whaDbg('[DBG] PRIVACY_TOKEN_NOTIF_ENTER from=' + String(attrs.from || '') +
+      ' sender_lid=' + String(attrs.sender_lid || ''));
+
+    // ── 1. Require the <tokens> wrapper ────────────────────────────────────────
+    const content    = Array.isArray(node.content) ? node.content : [];
+    const tokensNode = content.find(n => n && n.description === 'tokens');
+    if (!tokensNode) {
+      _whaDbg('[DBG] PRIVACY_TOKEN_NOTIF no <tokens> wrapper — abort\n');
+      return;
+    }
+
+    // ── 2. Resolve storage JID ─────────────────────────────────────────────────
+    // Priority:
+    //   1. sender_lid attr if it is a @lid JID
+    //   2. from user is a known LID user (LID comes as @s.whatsapp.net in notification)
+    //   3. from is a PN → look up LID in _pnToLid
+    //   4. bare from JID as fallback
+    const rawFrom      = String(attrs.from || '');
+    const rawSenderLid = attrs.sender_lid ? String(attrs.sender_lid) : null;
+    const fromUser     = rawFrom.split('@')[0].split(':')[0];
+
+    let storageJid;
+    if (rawSenderLid && rawSenderLid.endsWith('@lid')) {
+      // Explicit @lid sender_lid attr
+      storageJid = normalizeJidForTcToken(rawSenderLid);
+    } else if (this._lidToPn && this._lidToPn.has(fromUser)) {
+      // from = LID_USER@s.whatsapp.net — WA sends LID notifications this way.
+      // The user part is already the LID user; convert domain to @lid.
+      storageJid = fromUser + '@lid';
+    } else {
+      // Same resolver the send side uses, so both halves agree on the key.
+      storageJid = this._resolveTcTokenJid(rawFrom);
+    }
+
+    _whaDbg('[DBG] PRIVACY_TOKEN_NOTIF storageJid=' + storageJid);
+
+    // ── 3. Parse <token> children and store bytes (no senderTimestamp update) ──
+    // Reuse _storeTcTokenFromIqResult with the full notification node so that its
+    // <tokens><token> traversal is identical to the IQ-result code path.
+    // Pass { saveSenderTs: false } so we don't overwrite our own senderTimestamp.
+    this._storeTcTokenFromIqResult(node, storageJid, null, { saveSenderTs: false });
+  }
+
+  /**
+   * Fire-and-forget tcToken re-issuance after a peer's device identity changed.
+   * Called when we successfully decrypt a pkmsg — the peer opened a fresh Signal
+   * session (reset or new device), so we re-issue a privacy token so they can
+   * reach us.  Only fires if we've previously issued a token (senderTimestamp
+   * present and not expired).
+   *
+   * @param {string} from  - Signal-session JID (PN or LID JID of the sender)
+   */
+  _reissueTcTokenAfterIdentityChange(from) {
+    if (!this._tcTokenStore || !from) return;
+    const { normalizeJidForTcToken, tcTokenExpired } = require('./messages/TcTokenStore');
+
+    void (async () => {
+      try {
+        const tcJid = this._resolveTcTokenJid(from);
+
+        const entry    = this._tcTokenStore.get(tcJid);
+        const senderTs = entry && entry.senderTimestamp;
+        if (!senderTs || tcTokenExpired(senderTs)) {
+          // No previous issuance — nothing to re-issue
+          return;
+        }
+
+        _whaDbg('[DBG] REISSUE_TC_TOKEN_AFTER_IDENTITY_CHANGE jid=' + tcJid +
+          ' prevSenderTs=' + senderTs);
+
+        // The re-issue carries the *previous* senderTimestamp, not a fresh one,
+        // and the result is stored without touching the dedupe state. That
+        // matters: this is a repair of an existing grant after the peer's
+        // device changed, not a new grant, so it must not move the 7-day
+        // bucket that governs regular issuance. We were stamping it with
+        // Date.now(), which silently skipped the next scheduled issuance.
+        const issueJid = this._resolveTcTokenIssuanceJid(from);
+        const result   = await this._issuePrivacyTokens(issueJid, senderTs);
+        this._storeTcTokenFromIqResult(result, tcJid, senderTs, { saveSenderTs: false });
+      } catch (e) {
+        _whaDbg('[DBG] REISSUE_TC_TOKEN_ERR from=' + from +
+          ' err=' + (e && e.message));
+      }
+    })();
+  }
+
+  // ─── History sync ─────────────────────────────────────────────────────────
+
+  /**
+   * _handleHistorySync — called when a decrypted DM protocol message contains
+   * subtype='history_sync' with a HistorySyncNotification.
+   *
+   * Fires asynchronously (fire-and-forget with error emission).
+   * Emits 'history_sync' on success, 'history_sync_error' on failure.
+   *
+   * @param {object} notification  Decoded HistorySyncNotification
+   * @param {string} msgId         Source message ID (for logging)
+   */
+  _handleHistorySync(notification, msgId) {
+    if (!notification) return;
+    // Web-mode history lands in its own files. A number can be registered over
+    // SMS and separately linked as a companion, and only the companion ever
+    // receives history — merging the two would be merging different accounts'
+    // views of the same number. Same prefix the readers use.
+    const phone = this._sessionFilePrefix();
+    if (!phone) return;
+    const sessionDir = this._sessionDir;
+
+    _whaDbg('[DBG] HIST_SYNC start syncType=' + notification.syncType +
+      ' progress=' + notification.progress +
+      ' chunk=' + notification.chunkOrder +
+      ' inline=' + !!(notification.initialHistBootstrapInlinePayload &&
+                       notification.initialHistBootstrapInlinePayload.length) +
+      ' msgId=' + msgId);
+
+    processHistorySyncNotification(notification, sessionDir, phone)
+      .then(result => {
+        _whaDbg('[DBG] HIST_SYNC done syncType=' + result.syncTypeName +
+          ' chats=' + result.chats.length +
+          ' contacts=' + result.contacts.length +
+          ' pushNames=' + (result.pushNames || []).length);
+
+        // Populate in-memory LID ↔ PN mappings from history sync data
+        if (result.lidPnMappings && result.lidPnMappings.length) {
+          for (const m of result.lidPnMappings) {
+            if (m.lidJid && m.pnJid) {
+              const lidUser = m.lidJid.split('@')[0].split(':')[0];
+              const pnUser  = m.pnJid.split('@')[0].split(':')[0];
+              if (lidUser && pnUser) {
+                this._lidToPn.set(lidUser, pnUser);
+                this._pnToLid.set(pnUser, lidUser);
+                if (this._signal && this._signal.store && this._signal.store.setLidMapping) {
+                  this._signal.store.setLidMapping(pnUser, lidUser);
+                }
+              }
+            }
+          }
+        }
+
+        // Seed TcTokenStore from history — populates trusted-contact tokens
+        // for all existing conversations so the first send after reconnect
+        // already carries a valid <tctoken> node (avoids error 463 on cold start).
+        this._seedTcTokensFromHistory(result.merged);
+
+        this.emit('history_sync', result);
+      })
+      .catch(err => {
+        _whaDbg('[DBG] HIST_SYNC_ERR ' + (err && err.message));
+        this.emit('history_sync_error', { err, notification });
+      });
+  }
+
+  /**
+   * _seedTcTokensFromHistory — called after each history sync chunk.
+   *
+   * Reads tcToken/tcTokenTimestamp/tcTokenSenderTimestamp from the merged
+   * history store and loads them into TcTokenStore so that the first outbound
+   * DM after reconnect already has a valid <tctoken> node attached.
+   *
+   * Without this, TcTokenStore starts empty on every new connection and the
+   * first send to every existing contact is treated as an anonymous reach-out
+   * by the WhatsApp server, accumulating toward the error-463 timelock.
+   *
+   * Rules:
+   *  - Only seeds tokens that are not already in TcTokenStore (existing entry wins).
+   *  - Skips expired tokens (no point loading a token we'd immediately discard).
+   *  - Storage key follows TcTokenStore convention: normalized bare JID.
+   *    For LID chats (jid ends in @lid) we use the lid JID directly.
+   *    For PN chats we try to look up the LID first, since storage is by LID.
+   *
+   * @param {object|null} merged  - Return value of mergeHistoryToStore()
+   */
+  _seedTcTokensFromHistory(merged) {
+    if (!merged || !merged.chats) return;
+    if (!this._tcTokenStore) return;
+
+    const { normalizeJidForTcToken, tcTokenExpired } = require('./messages/TcTokenStore');
+
+    let seeded = 0;
+    for (const [jid, chat] of Object.entries(merged.chats)) {
+      // Only chats that actually have a token stored from history
+      if (!chat.tcToken) continue;
+
+      // Convert base64 string back to Buffer (mergeHistoryToStore stores as base64)
+      const tokenBuf = Buffer.from(chat.tcToken, 'base64');
+      if (!tokenBuf.length) continue;
+
+      const ts       = chat.tcTokenTimestamp      || 0;
+      const senderTs = chat.tcTokenSenderTimestamp || 0;
+
+      // Skip already-expired tokens — no use loading them
+      if (tcTokenExpired(ts)) {
+        _whaDbg('[DBG] SEED_TCTOKEN skip expired jid=' + jid + ' ts=' + ts);
+        continue;
+      }
+
+      // Resolve storage JID — storage is always by LID.
+      // If this chat is a @lid jid, use it directly.
+      // If it's a PN jid, try to find its LID counterpart.
+      let storageJid;
+      if (jid.endsWith('@lid')) {
+        storageJid = normalizeJidForTcToken(jid);
+      } else {
+        const pnUser  = jid.split('@')[0].split(':')[0];
+        const lidUser = this._pnToLid && this._pnToLid.get(pnUser);
+        storageJid    = lidUser
+          ? normalizeJidForTcToken(lidUser + '@lid')
+          : normalizeJidForTcToken(jid);
+      }
+
+      // Don't overwrite a token that was already fetched live this session
+      const existing = this._tcTokenStore.get(storageJid);
+      if (existing && existing.token && existing.token.length &&
+          !tcTokenExpired(existing.timestamp)) {
+        _whaDbg('[DBG] SEED_TCTOKEN skip existing jid=' + storageJid);
+        continue;
+      }
+
+      // Set token + senderTimestamp atomically via the two TcTokenStore setters
+      this._tcTokenStore.setToken(storageJid, tokenBuf, ts);
+      if (senderTs) {
+        this._tcTokenStore.setSenderTimestamp(storageJid, senderTs);
+      }
+      seeded++;
+      _whaDbg('[DBG] SEED_TCTOKEN seeded jid=' + storageJid +
+        ' ts=' + ts + ' senderTs=' + senderTs + ' len=' + tokenBuf.length);
+    }
+
+    if (seeded > 0) {
+      _whaDbg('[DBG] SEED_TCTOKEN total seeded=' + seeded + ' from history');
+    }
+  }
+
+  /**
+   * _handleAppStateSyncKeyShare — saves app-state sync keys received in a
+   * ProtocolMessage (type=5 APP_STATE_SYNC_KEY_SHARE).
+   * These keys are needed to decrypt app-state patches in _syncAppState.
+   *
+   * @param {object} keyShare  Decoded AppStateSyncKeyShare { keys: [...] }
+   */
+  _handleAppStateSyncKeyShare(keyShare) {
+    if (!keyShare || !keyShare.keys || !keyShare.keys.length) return;
+    const phone      = this._store && this._store.phoneNumber;
+    const sessionDir = this._sessionDir;
+
+    _whaDbg('[DBG] APP_STATE_KEY_SHARE keys=' + keyShare.keys.length);
+
+    try {
+      saveAppStateSyncKeys(sessionDir, phone, keyShare);
+    } catch (e) {
+      _whaDbg('[DBG] APP_STATE_KEY_SHARE_SAVE_ERR ' + e.message);
+    }
+
+    // A key that has arrived is no longer one we are holding a request down
+    // for; drop the hold so that if it is ever missing again the ask goes out
+    // at once rather than a day later.
+    if (this._appStateKeyRequests) {
+      for (const k of keyShare.keys) {
+        if (!k || !k.keyId) continue;
+        try {
+          this._appStateKeyRequests.delete(
+            Buffer.from(k.keyId, 'hex').toString('base64'));
+        } catch (_) {}
+      }
+    }
+
+    this.emit('app_state_keys', { keys: keyShare.keys });
+
+    // The key is what app state was waiting on. Anything the server has been
+    // holding for us can be read now, so go and get it rather than sitting on
+    // it until the next dirty bit happens along.
+    if (this._connected && this._appState) {
+      this.syncAppState().catch(err => {
+        _whaDbg('[DBG] APP_STATE sync after key share failed: ' + (err && err.message));
+      });
+    }
+  }
+
+  /**
+   * _handleMdMsgHistNotification — called when server sends a
+   * <notification type="md-msg-hist"> node.
+   *
+   * On mobile WhatsApp the primary history sync path is via encrypted DM
+   * protocol messages (HistorySyncNotification inside a ProtocolMessage type=6).
+   * This handler covers the secondary path where the server delivers the
+   * notification inline inside the notification node itself with an <enc> child,
+   * or simply signals availability so we emit the event.
+   *
+   * @param {object} node  Full BinaryNode of the notification
+   */
+  _handleMdMsgHistNotification(node) {
+    if (!node) return;
+    const attrs = node.attrs || {};
+
+    _whaDbg('[DBG] MD_MSG_HIST from=' + (attrs.from || '') + ' id=' + (attrs.id || ''));
+
+    // Check for inline HistorySyncNotification bytes in an <enc> child
+    // (some server versions deliver it this way)
+    const encNode = findChild(node, 'enc');
+    if (encNode) {
+      const encBuf = Buffer.isBuffer(encNode.content)
+        ? encNode.content
+        : (encNode.content ? Buffer.from(encNode.content) : null);
+
+      if (encBuf && encBuf.length > 0) {
+        // Try to decode directly as HistorySyncNotification (unencrypted path)
+        try {
+          const notification = decodeHistorySyncNotification(encBuf);
+          if (notification && (notification.directPath || notification.initialHistBootstrapInlinePayload)) {
+            _whaDbg('[DBG] MD_MSG_HIST inline notification directPath=' + notification.directPath);
+            this._handleHistorySync(notification, attrs.id || 'md-msg-hist');
+            return;
+          }
+        } catch (_) {}
+      }
+    }
+
+    // Emit raw event for the caller to inspect if needed
+    this.emit('md_msg_hist', { node, attrs });
+  }
+
+  /**
+   * The name every file of this session is built from.
+   *
+   * A number can be registered over SMS and separately linked as a companion,
+   * and the two are different accounts' views of it, so the companion's files
+   * carry a `.web` in the middle: 40712345678.web.history.json. Everything that
+   * reads or writes one has to agree on that — a writer that adds the `.web`
+   * and a reader that does not will not error, it will simply never find the
+   * file it just wrote.
+   */
+  _sessionFilePrefix() {
+    if (!this._store || !this._store.phoneNumber) return null;
+    return this._store.phoneNumber + (this._mode === 'web' ? '.web' : '');
+  }
+
+  _readSessionJson(suffix) {
+    const prefix = this._sessionFilePrefix();
+    if (!prefix) return null;
+    const fs   = require('fs');
+    const file = require('path').join(this._sessionDir, prefix + suffix);
+    try {
+      if (!fs.existsSync(file)) return null;
+      return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (_) { return null; }
+  }
+
+  /**
+   * getHistoryStore — load the persisted history store for this session.
+   * Returns the parsed {phone}.history.json content — {phone}.web.history.json
+   * on a companion — or null if not yet synced.
+   *
+   * @returns {object|null}
+   */
+  getHistoryStore() {
+    return this._readSessionJson('.history.json');
+  }
+
+  /**
+   * getMessagesStore — load the persisted messages for this session.
+   * Returns the parsed {phone}.messages.json content — {phone}.web.messages.json
+   * on a companion — or null if not yet synced.
+   *
+   * @returns {object|null}
+   */
+  getMessagesStore() {
+    return this._readSessionJson('.messages.json');
+  }
+
+  /**
+   * What this primary has kept of the messages it sent and received, with
+   * whatever it knows it missed (`losses`). Null when the store is off, on a
+   * companion session, before the first login or after disconnect(), or when
+   * it could not be opened or read — 'primary_message_store_error' says why.
+   *
+   * @returns {object|null}  a PrimaryMessageStore snapshot
+   */
+  getPrimaryMessageStore() {
+    const store = this._messageStore;
+    if (!store) return null;
+    try { return store.snapshot(); }
+    catch (err) { this._captureFailed('snapshot', err); }
+    // What has expired could not be written down. What is held still goes
+    // out, with the expired content withheld all the same.
+    try { return store.snapshot({ sweep: false }); }
+    catch (err) { this._captureFailed('snapshot', err); return null; }
+  }
+
+  // The snapshot bootstrapPrimaryCompanion({ history: 'store' }) sends, taken
+  // the way it takes it: a store that is off, or cannot produce one, throws
+  // with its own code. Unlike getPrimaryMessageStore() there is no fallback,
+  // so link readiness (lib/primary/Readiness.js) reads through here too and
+  // never calls ready a store the bootstrap would then fail to read.
+  _primaryHistorySnapshot() {
+    require('./PrimaryLinkCrypto').requireValue(this._messageStore, 'PRIMARY_MESSAGE_STORE_DISABLED');
+    return this._messageStore.snapshot();
+  }
+
+  // ─── Public API ───────────────────────────────────────────────────────────
+
+  // Alias kept from the original API — setOnline is the implementation.
+  setPresence(available) {
+    return this.setOnline(available);
+  }
+
+  // Mark messages as read — the sender's two blue ticks.
+  //
+  // jid        chat the messages are in (the group JID for a group)
+  // messageIds one id or an array of ids, all from the SAME sender
+  // opts       { participant, type } — participant is who sent them and is
+  //            required in a group; type may be 'read' (default) or 'played'
+  //            to mark a voice note as listened to.
+  //
+  // The FIRST id goes on the receipt and the rest as <item> children of a
+  // <list> node. The last id used to be used instead, with the items straight
+  // inside <receipt>, which is not a shape the server
+  // reads back — the extra ids were silently ignored, so only one message per
+  // call was ever marked. The participant was missing entirely, so a group read
+  // never told the server whose message had been read.
+  markRead(jid, messageIds, opts) {
+    if (!this._socket || !this._connected) return;
+    const ids = (Array.isArray(messageIds) ? messageIds : [messageIds])
+      .map(String).filter(Boolean);
+    if (ids.length === 0) return;
+
+    opts = opts || {};
+    const chatJid = makeJid(jid);
+    const isGroup = chatJid.endsWith('@g.us') || chatJid.endsWith('@community')
+      || chatJid.endsWith('@broadcast');
+
+    const attrs = {
+      id:   ids[0],
+      type: this._readReceiptType(opts.type === 'played' ? 'played' : 'read'),
+      to:   jidStrToObj(chatJid),
+      t:    String(Math.floor(Date.now() / 1000))
+    };
+    // Only group and broadcast receipts carry a participant; on a 1:1 chat the
+    // `to` already identifies the sender.
+    if (isGroup && opts.participant) {
+      attrs.participant = jidStrToObj(makeJid(opts.participant));
+    }
+
+    const children = ids.length > 1
+      ? [new BinaryNode('list', {}, ids.slice(1).map(
+          id => new BinaryNode('item', { id }, null)))]
+      : null;
+
+    this._socket.sendNode(new BinaryNode('receipt', attrs, children));
+    this._captureRead(chatJid, ids, opts.type === 'played', opts.participant || chatJid);
+  }
+
+  async sendText(to, text, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendText(to, text, opts);
+  }
+
+  async sendImage(to, data, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendImage(to, data, opts);
+  }
+
+  async sendVideo(to, data, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendVideo(to, data, opts);
+  }
+
+  async sendAudio(to, data, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendAudio(to, data, opts);
+  }
+
+  async sendDocument(to, data, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendDocument(to, data, opts);
+  }
+
+  async sendSticker(to, data, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendSticker(to, data, opts);
+  }
+
+  async sendReaction(to, messageId, emoji, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendReaction(to, messageId, emoji, opts);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // PRESENCE
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Our own JID in the family a chat is addressed with — the LID when the chat
+  // is LID-addressed, the phone JID otherwise. chatstate carries a `from`, and
+  // it has to be in the same space as the `to` beside it.
+  _ownJidFor(chatJid) {
+    const str = String(chatJid || '');
+    if (str.endsWith('@lid') && this._myLid) {
+      return String(this._myLid).split('@')[0].split(':')[0] + '@lid';
+    }
+    return String(this._store && this._store.phoneNumber) + '@s.whatsapp.net';
+  }
+
+  // Set global online/offline status.
+  //
+  // This is refused without a push name: the server takes the display name from
+  // this node, and sending it empty makes
+  // every other user see "-" instead of a name. Going available also flips the
+  // client into sending active delivery receipts — see _sendDeliveryReceipt.
+  //
+  // Returns true when the node went out, false when it was skipped.
+  setOnline(available) {
+    if (!this._socket || !this._connected) return false;
+    const name = (this._store && (this._store.pushName || this._store.name)) || '';
+    if (!name) {
+      _whaDbg('[DBG] PRESENCE skipped: no push name set — other users would see "-"');
+      return false;
+    }
+    this._sendActiveReceipts = !!available;
+    this._socket.sendNode(new BinaryNode('presence', {
+      name,
+      type: available ? 'available' : 'unavailable'
+    }, null));
+    return true;
+  }
+
+  // Set typing/recording presence in a specific chat.
+  // presence: 'composing' | 'paused' | 'recording'
+  //
+  // Both `from` (our own JID) and `to` go on the chatstate node, and recording
+  // is expressed as composing with media="audio" — there is no separate
+  // recording state in the protocol. The `from` was missing
+  // here, and both JIDs were raw strings, which the server ignores for @lid
+  // chats, so the indicator never showed for a LID-addressed contact.
+  setChatPresence(chatJid, presence) {
+    if (!this._socket || !this._connected) return;
+    const jid   = makeJid(chatJid);
+    const attrs = {
+      from: jidStrToObj(this._ownJidFor(jid)),
+      to:   jidStrToObj(jid)
+    };
+    if (presence === 'composing' || presence === 'recording') {
+      const stateAttrs = presence === 'recording' ? { media: 'audio' } : {};
+      this._socket.sendNode(new BinaryNode('chatstate', attrs, [
+        new BinaryNode('composing', stateAttrs, null)
+      ]));
+    } else {
+      this._socket.sendNode(new BinaryNode('chatstate', attrs, [
+        new BinaryNode('paused', {}, null)
+      ]));
+    }
+  }
+
+  // Subscribe to presence updates for contacts.
+  //
+  // The contact's privacy token is attached when there is one; without it the
+  // server may decline to send their presence. The server also only forwards
+  // presence to clients that have marked themselves available, so call
+  // setOnline(true) first.
+  subscribeToPresence(jids) {
+    if (!this._socket || !this._connected) return;
+    const arr = Array.isArray(jids) ? jids : [jids];
+    const { isRegularTcTokenUser } = require('./messages/TcTokenStore');
+    for (const raw of arr) {
+      const jid   = makeJid(raw);
+      // Groups and newsletters have no privacy token.
+      const token = isRegularTcTokenUser(jid) ? this._tcTokenFor(jid) : null;
+      const children = token ? [new BinaryNode('tctoken', {}, token)] : null;
+      this._socket.sendNode(new BinaryNode('presence', {
+        to:   jidStrToObj(jid),
+        type: 'subscribe'
+      }, children));
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // PROFILE — hasWhatsapp, queryAbout, queryPicture, changeName, changeAbout,
+  //           changeProfilePicture, changePrivacySetting
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Check which phone numbers have WhatsApp)
+  // jids: array of phone numbers or JIDs like '123456789' or '123@s.whatsapp.net'
+  // Returns array of JIDs that have WhatsApp
+  async hasWhatsapp(jids) {
+    const arr = Array.isArray(jids) ? jids : [jids];
+    const userNodes = arr.map(j => {
+      const phone = String(j).replace(/@.*$/, '').replace(/\D/g, '');
+      return new BinaryNode('user', {}, [
+        new BinaryNode('contact', {}, Buffer.from('+' + phone, 'utf8'))
+      ]);
+    });
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'usync'
+    }, [
+      new BinaryNode('usync', {
+        sid:     this._genMsgId(),
+        mode:    'query',
+        last:    'true',
+        index:   '0',
+        context: 'interactive'
+      }, [
+        new BinaryNode('query', {}, [new BinaryNode('contact', {}, null)]),
+        new BinaryNode('list',  {}, userNodes),
+        new BinaryNode('side_list', {}, null)
+      ])
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return [];
+    const usync = findChild(resp, 'usync');
+    if (!usync) return [];
+    const list = findChild(usync, 'list');
+    if (!list || !Array.isArray(list.content)) return [];
+    return list.content
+      .filter(u => {
+        if (!u || u.description !== 'user') return false;
+        const ct = findChild(u, 'contact');
+        return ct && ct.attrs && ct.attrs.type === 'in';
+      })
+      .map(u => u.attrs && u.attrs.jid)
+      .filter(Boolean);
+  }
+
+  // Query bio/status text of a contact
+  async queryAbout(jid) {
+    const jidFull = makeJid(jid);
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'usync'
+    }, [
+      new BinaryNode('usync', {
+        sid:     this._genMsgId(),
+        mode:    'query',
+        last:    'true',
+        index:   '0',
+        context: 'interactive'
+      }, [
+        new BinaryNode('query', {}, [new BinaryNode('status', {}, null)]),
+        new BinaryNode('list',  {}, [new BinaryNode('user', { jid: jidFull }, null)]),
+        new BinaryNode('side_list', {}, null)
+      ])
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return null;
+    const usync = findChild(resp, 'usync');
+    if (!usync) return null;
+    const list = findChild(usync, 'list');
+    if (!list || !Array.isArray(list.content)) return null;
+    for (const user of list.content) {
+      const st = findChild(user, 'status');
+      if (st) {
+        const buf = getNodeContent(st);
+        return buf ? buf.toString('utf8') : null;
+      }
+    }
+    return null;
+  }
+
+  // Query profile picture URL
+  // Profile picture URL, or null when there is none.
+  // Unchanged signature; queryPictureInfo has the rest of what the server sends.
+  async queryPicture(jid, opts) {
+    const info = await this.queryPictureInfo(jid, opts);
+    return (info && info.url) || null;
+  }
+
+  // Full profile picture info: { id, url, type, directPath, hash }, or null
+  // when the user has no
+  // picture or it has not changed since opts.existingId.
+  //
+  // opts: { preview, existingId, isCommunity }
+  //   preview     ask for the small thumbnail instead of the full image
+  //   existingId  the id you already hold — the server answers 304 and this
+  //               returns null when it still matches
+  //   isCommunity resolve a community's picture, which goes through w:g2
+  //
+  // The target was a raw string before, which the server drops for an @lid, and
+  // the reply's status codes were not read at all: a 204 (no picture set) has no
+  // url attribute, so it came back as null with no way to tell it apart from a
+  // failed query.
+  async queryPictureInfo(jid, opts) {
+    opts = opts || {};
+    const jidFull = makeJid(jid);
+    const attrs = {
+      query: 'url',
+      type:  opts.preview ? 'preview' : 'image'
+    };
+    if (opts.existingId) attrs.id = String(opts.existingId);
+    if (opts.inviteCode) attrs.invite = String(opts.inviteCode);
+
+    let iqAttrs, content;
+    if (opts.isCommunity) {
+      attrs.parent_group_jid = jidStrToObj(jidFull);
+      iqAttrs = { id: this._genMsgId(), xmlns: 'w:g2', to: jidStrToObj(jidFull), type: 'get' };
+      content = [new BinaryNode('pictures', {}, [new BinaryNode('picture', attrs, null)])];
+    } else {
+      const picToken    = this._tcTokenFor(jidFull);
+      const picChildren = picToken ? [new BinaryNode('tctoken', {}, picToken)] : null;
+      iqAttrs = {
+        id:     this._genMsgId(),
+        xmlns:  'w:profile:picture',
+        to:     's.whatsapp.net',
+        target: jidStrToObj(jidFull),
+        type:   'get'
+      };
+      content = [new BinaryNode('picture', attrs, picChildren)];
+    }
+
+    const resp = await this._sendIq(new BinaryNode('iq', iqAttrs, content));
+    if (!resp) return null;
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && String(errNode.attrs.code);
+      // 404 = no picture set, 401/403 = their privacy settings hide it. Neither
+      // is a failure worth throwing over.
+      if (code === '404' || code === '401' || code === '403') return null;
+      throw new Boom('queryPictureInfo: server rejected the request' +
+        (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    const wrapper = opts.isCommunity ? findChild(resp, 'pictures') : resp;
+    const pic = wrapper ? findChild(wrapper, 'picture') : null;
+    if (!pic || !pic.attrs) return null;
+
+    const status = pic.attrs.status ? parseInt(pic.attrs.status, 10) : 0;
+    if (status === 304 || status === 204) return null;   // unchanged / not set
+
+    return {
+      id:         pic.attrs.id         ? String(pic.attrs.id)         : null,
+      url:        pic.attrs.url        ? String(pic.attrs.url)        : null,
+      type:       pic.attrs.type       ? String(pic.attrs.type)       : null,
+      directPath: pic.attrs.direct_path ? String(pic.attrs.direct_path) : null,
+      hash:       pic.attrs.hash
+        ? Buffer.from(String(pic.attrs.hash), 'base64')
+        : null
+    };
+  }
+
+  // Download a profile picture and hand back the JPEG bytes, or null when the
+  // user has none. Profile pictures are served unencrypted, unlike message
+  // media, so this is a plain fetch of the URL the query returns.
+  async downloadProfilePicture(jid, opts) {
+    const info = await this.queryPictureInfo(jid, opts);
+    if (!info || !info.url) return null;
+    const { httpGetBuffer } = require('./MediaService');
+    return httpGetBuffer(info.url, { web: this._mode === 'web' });
+  }
+
+  // Download and decrypt the media on a received message.
+  //
+  // Pass the decoded message straight through — `msg.decoded` from a `message`
+  // event, or the object itself:
+  //
+  //   client.on('message', async (msg) => {
+  //     if (msg.decoded && msg.decoded.mediaKey) {
+  //       fs.writeFileSync('out.jpg', await client.downloadMedia(msg.decoded))
+  //     }
+  //   })
+  //
+  // The CDN applies the same browser check on the way down as on the way up, so
+  // a companion has to identify itself as one here too. Doing it by hand means
+  // knowing that, and knowing which key name each media type derives from — get
+  // either wrong and the download is refused or the decryption produces garbage.
+  //
+  // A file already saved from a previous run can be verified against the
+  // message with { verify: true }, which checks fileEncSha256 before decrypting.
+  async downloadMedia(decoded, opts) {
+    opts = opts || {};
+    const d = (decoded && decoded.decoded) ? decoded.decoded : decoded;
+    if (!d || !d.type) throw new Boom('downloadMedia: a decoded message is required', { statusCode: 400 });
+    if (!d.mediaKey)   throw new Boom('downloadMedia: this message carries no media', { statusCode: 400 });
+
+
+    // A voice note is an audio message with PTT set, and a GIF a video with the
+    // playback flag — both derive from the plain type's keys.
+    const KEY_NAME = {
+      image: 'image', video: 'video', audio: 'audio', voice: 'ptt',
+      ptt: 'ptt', document: 'document', sticker: 'sticker', gif: 'gif'
+    };
+    const { downloadMedia, getMediaKeyName, resolveMediaUrl } = require('./MediaService');
+    const url = resolveMediaUrl(d.url, d.directPath);
+    if (!url) throw new Boom('downloadMedia: the message has no CDN location', { statusCode: 400 });
+    const keyName = getMediaKeyName(KEY_NAME[d.type] || d.type);
+    if (!keyName) throw new Boom('downloadMedia: unsupported media type "' + d.type + '"', { statusCode: 400 });
+
+    // Both digests go down by default. The message says what the file should
+    // be; there is no reason to take the CDN's word for it. `verify: false`
+    // turns them off for a caller that wants the bytes whatever they are — the
+    // MAC is checked either way, and that is the one that authenticates.
+    return downloadMedia(url, d.mediaKey, keyName, {
+      web:           this._mode === 'web',
+      verify:        opts.verify !== false,
+      fileEncSha256: d.fileEncSha256,
+      fileSha256:    d.fileSha256
+    });
+  }
+
+  /**
+   * Download the preview image of a message that quoted a link.
+   *
+   * A link preview's thumbnail is a media file in its own right — its own
+   * directPath, its own mediaKey, its own digests — carried beside the text
+   * rather than inside it, and encrypted under a key name of its own. So
+   * `downloadMedia` cannot fetch it: that reads the message's own media, and a
+   * text message has none. This is the reference client's thumbnail download.
+   *
+   * The small inline preview is a different thing and needs no download: it is
+   * already on the decoded message as `jpegThumbnail`.
+   *
+   * @param {object} decoded  a decoded message, or the `message` event payload
+   * @param {object} [opts]   `verify: false` to skip the digest checks
+   * @returns {Promise<Buffer>} the full-size preview image
+   */
+  async downloadThumbnail(decoded, opts) {
+    opts = opts || {};
+    const d = (decoded && decoded.decoded) ? decoded.decoded : decoded;
+    if (!d) throw new Boom('downloadThumbnail: a decoded message is required', { statusCode: 400 });
+
+    const thumb = d.thumbnail;
+    if (!thumb || !thumb.mediaKey) {
+      throw new Boom('downloadThumbnail: this message carries no downloadable ' +
+        'thumbnail (a link preview without one, or not a link at all)', { statusCode: 400 });
+    }
+
+    const { downloadMedia, getThumbnailKeyName, resolveMediaUrl } =
+      require('./MediaService');
+    const keyName = getThumbnailKeyName(d.type === 'text' ? 'text' : d.type);
+    if (!keyName) {
+      throw new Boom('downloadThumbnail: no thumbnail key name for "' + d.type + '"', { statusCode: 400 });
+    }
+    const url = resolveMediaUrl(null, thumb.directPath);
+    if (!url) throw new Boom('downloadThumbnail: the thumbnail has no CDN location', { statusCode: 400 });
+
+    return downloadMedia(url, thumb.mediaKey, keyName, {
+      web:           this._mode === 'web',
+      verify:        opts.verify !== false,
+      fileEncSha256: thumb.thumbnailEncSha256,
+      fileSha256:    thumb.thumbnailSha256
+    });
+  }
+
+  // Parse the <list> a blocklist query or update comes back with.
+  //
+  // Every child is walked and its jid taken, whatever the tag is called, with
+  // the dhash kept off the list itself.
+  // The JIDs are stringified here: the binary decoder hands them back as JID
+  // objects, and while those print correctly they are not strings, so the array
+  // this used to return failed any includes() or === against a JID string —
+  // which is exactly what the documented shape invites you to do.
+  _parseBlocklist(listNode) {
+    const jids = [];
+    if (listNode && Array.isArray(listNode.content)) {
+      for (const child of listNode.content) {
+        if (!child || !child.attrs || !child.attrs.jid) continue;
+        jids.push(String(child.attrs.jid));
+      }
+    }
+    const dhash = (listNode && listNode.attrs && listNode.attrs.dhash)
+      ? String(listNode.attrs.dhash) : null;
+    return { dhash, jids };
+  }
+
+  // Query blocked contacts list. Returns an array of JID strings; never throws,
+  // an unreachable server yields an empty list.
+  async queryBlockList() {
+    const id   = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'blocklist',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, null);
+    const resp = await this._sendIq(node);
+    if (!resp) return [];
+    if (resp.attrs && resp.attrs.type === 'error') return [];
+    return this._parseBlocklist(findChild(resp, 'list')).jids;
+  }
+
+  // Keep the requested name through restarts and publish it by presence.
+  // If a sync key exists, also write setting_pushName for linked devices.
+  // The boolean describes that App State write only: false is not a pending
+  // job, and true is not a readback of the account's server display_name.
+  changeName(name) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (typeof name !== 'string') throw new TypeError('name must be a string');
+    const clean = require('./Store').normalizePushName(name);
+    if (!clean) throw new Boom('name must contain a non-placeholder display name', { statusCode: 400 });
+    name = clean;
+    // Save intent before sending: a server observation or stale app-state
+    // snapshot arriving during the request cannot overwrite the user's choice.
+    if (this._store) {
+      this._store.name = name;
+      this._store.pushName = name;
+      this._store.pendingPushName = name;
+      this._persistStore();
+    }
+    // A presence node carrying only a name is a name republish: it says what
+    // this account is called without also describing whether it is online.
+    // Carrying a type turns it into an availability update that happens to
+    // mention a name, which is a different thing to ask for and is not what a
+    // rename is. The bare form goes first, on its own.
+    this._socket.sendNode(new BinaryNode('presence', { name }, null));
+
+    // And the same name again on an availability node, unconditionally. The
+    // bare form above is what a browser client sends, but the implementation
+    // with the longest production record only ever sends this one, and ties the
+    // server learning your name to it: announce it at least once after
+    // connecting or other people see a placeholder instead. Making it
+    // conditional on already being marked available would leave a session that
+    // renames before going online with only the form that may be ignored.
+    this._socket.sendNode(new BinaryNode('presence', {
+      name,
+      type: 'available'
+    }, null));
+
+    return this._appStatePatchOrFallback(AppMutations.pushNamePatch(name))
+      .then(synced => {
+        _whaDbg(synced
+          ? '[DBG] PUSHNAME persisted in app state: ' + name
+          : '[DBG] PUSHNAME announced; App State write not confirmed (no sync key)');
+        return synced;
+      })
+      .catch(err => {
+        _whaDbg('[DBG] PUSHNAME app state write failed: ' + (err && err.message));
+        return false;
+      });
+  }
+
+  // Change bio/about text
+  //
+  // The <status> child is the shape the server reads. The envelope was not:
+  // this IQ has to be addressed to the server as a *JID* with nobody in the
+  // user part, which goes out as JID_PAIR + empty user + the server
+  // token. This wrote the bare string 's.whatsapp.net', and a bare string is
+  // encoded as a plain dictionary token, so where every other client puts an
+  // address the server was reading text. That is the whole of the difference,
+  // and it is invisible in a stanza log, which prints the node before it is
+  // encoded: both spellings read `to="s.whatsapp.net"` on screen.
+  //
+  // The reply was thrown away as well. _sendIq answers null on a timeout and
+  // hands back error stanzas unread, so a refusal, a silence and a success all
+  // returned the same thing — which is how "about updated" came to be printed
+  // for a change that never happened.
+  async changeAbout(text) {
+    const body = String(text == null ? '' : text);
+    // The limit the apps impose. A longer one is dropped rather than refused,
+    // so it would otherwise look exactly like this bug.
+    if (Array.from(body).length > ABOUT_MAX_LENGTH) {
+      throw new Boom('changeAbout: an about is limited to ' + ABOUT_MAX_LENGTH +
+        ' characters — the server drops a longer one instead of refusing it', { statusCode: 400 });
+    }
+
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'status',
+      to:    jidStrToObj('@s.whatsapp.net'),
+      type:  'set'
+    }, [
+      new BinaryNode('status', {}, Buffer.from(body, 'utf8'))
+    ]);
+
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom('changeAbout: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      const errText = errNode && errNode.attrs && errNode.attrs.text;
+      throw new Boom('changeAbout: server rejected the change' +
+        (code ? ' (' + code + (errText ? ' ' + errText : '') + ')' : ''), { statusCode: statusFrom(code) });
+    }
+    return resp;
+  }
+
+  // The about this account currently has, as the server reports it.
+  //
+  // The set IQ is answered before the new text has to be visible anywhere, so
+  // an empty result proves only that the stanza was understood. Reading it back
+  // is the only way to tell an about the server stored from one it took and
+  // dropped — and it is asked exactly the way a contact's is.
+  async queryOwnAbout() {
+    const me = this._store &&
+      (this._store.phoneNumber || (this._store.me && this._store.me.id));
+    if (!me) throw new Boom('queryOwnAbout: not connected', { statusCode: 428 });
+    return this.queryAbout(String(me));
+  }
+
+  // Change profile picture
+  // buf: Buffer with JPEG image data
+  // Change your own profile picture.
+  //
+  // buf: a Buffer holding any image, or null to remove the current picture.
+  // Returns the new picture id, or 'remove' when it was taken down.
+  //
+  // The image is re-encoded to the square 640x640 JPEG the server expects
+  // before it goes out. Sending a file as it came off disk is what a person
+  // naturally tries and what the server silently drops — pass { raw: true } to
+  // skip that if you have already prepared it yourself.
+  //
+  // `target` names *whose* picture is being set, and is left off entirely when
+  // it is your own — the server infers that from the session. A group picture
+  // carries a target and works; the same IQ with your own JID in target does
+  // not, and the server's answer to that is silence rather than a refusal.
+  //
+  // This has now been wrong in both directions: first addressed *to* the
+  // account, then addressed about it. It is neither — it is addressed to the
+  // server with nothing named at all.
+  async changeProfilePicture(buf, opts) {
+    if (!this._store) throw new Boom('Not connected', { statusCode: 428 });
+    opts = opts || {};
+    const picture = (buf && !opts.raw) ? await prepareProfilePicture(buf, opts) : buf;
+
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'w:profile:picture',
+      to:    's.whatsapp.net',
+      type:  'set'
+    }, picture ? [new BinaryNode('picture', { type: 'image' }, picture)] : null);
+
+    const resp = await this._sendIq(node);
+    if (!resp) {
+      throw new Boom('changeProfilePicture: no reply from server (IQ timed out). ' +
+        'The server drops a picture it will not take rather than refusing it, so ' +
+        'this usually means the image was not in the form it wants' +
+        (opts.raw ? ' — this call passed { raw: true }, so nothing was re-encoded'
+                  : '') + '.', { statusCode: 408 });
+    }
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      if (String(code) === '406') {
+        throw new Boom(_pictureRejected('changeProfilePicture', picture, buf, opts), { statusCode: 406 });
+      }
+      throw new Boom('changeProfilePicture: ' +
+        (String(code) === '401' ? 'not authorised to change this picture'
+       : 'server rejected the request' + (code ? ' (' + code + ')' : '')), { statusCode: statusFrom(code) });
+    }
+
+    if (!buf) return 'remove';
+    const picNode = findChild(resp, 'picture');
+    return (picNode && picNode.attrs && picNode.attrs.id)
+      ? String(picNode.attrs.id) : null;
+  }
+
+  // ─── Privacy settings ─────────────────────────────────────────────────────
+
+  // Read the current privacy settings.
+  //
+  // Returns { lastSeen, profile, status, online, readReceipts, groupAdd,
+  //           callAdd, messages, defense, stickers } — any the server did not
+  // report come back null. Served from cache unless opts.force is set.
+  //
+  // There was no way to read these at all before, which also meant nothing
+  // could act on them; see markRead for what that cost.
+  async queryPrivacySettings(opts) {
+    opts = opts || {};
+    if (this._privacySettings && !opts.force) return this._privacySettings;
+
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'privacy',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, [new BinaryNode('privacy', {}, null)]);
+
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom('queryPrivacySettings: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('queryPrivacySettings: server rejected the request' +
+        (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+    const privacyNode = findChild(resp, 'privacy');
+    this._privacySettings = this._parsePrivacySettings(privacyNode);
+    return this._privacySettings;
+  }
+
+  // <privacy><category name="..." value="..."/>...</privacy>
+  _parsePrivacySettings(privacyNode) {
+    const out = {};
+    for (const key of Object.keys(PRIVACY_WIRE_TO_KEY)) out[PRIVACY_WIRE_TO_KEY[key]] = null;
+    if (privacyNode && Array.isArray(privacyNode.content)) {
+      for (const child of privacyNode.content) {
+        if (!child || child.description !== 'category' || !child.attrs) continue;
+        const key = PRIVACY_WIRE_TO_KEY[String(child.attrs.name)];
+        if (key) out[key] = child.attrs.value ? String(child.attrs.value) : null;
+      }
+    }
+    return out;
+  }
+
+  // Change a privacy setting. Returns the settings as they now stand.
+  //
+  // type:  'last_seen' | 'profile_picture' | 'status' | 'online' |
+  //        'read_receipts' | 'groups_add' | 'call_add' | 'messages' |
+  //        'defense' | 'stickers'   (the protocol's own spellings work too)
+  // value: 'all' | 'contacts' | 'contact_blacklist' | 'contact_allowlist' |
+  //        'none' | 'match_last_seen' | 'known' | 'on_standard' | 'off'
+  // excluded: JIDs to exclude — see the note below
+  //
+  // The names above are friendly aliases. What goes on the wire is: last,
+  // profile, status, online, readreceipts, groupadd, calladd, messages,
+  // defense, stickers. Four of the six names this used to
+  // put on the wire — last_seen, profile_picture, read_receipts, groups_add —
+  // are not names the server knows, so those settings never changed and the
+  // discarded reply meant it never said so either.
+  async changePrivacySetting(type, value, excluded) {
+    const name = PRIVACY_NAME_ALIASES[String(type)];
+    if (!name) {
+      throw new Boom('changePrivacySetting: unknown setting "' + type + '" — one of ' +
+        Object.keys(PRIVACY_NAME_ALIASES).join(', '), { statusCode: 400 });
+    }
+
+    const wireValue = this._privacyWireValue(name, value);
+
+    // WhatsApp Web does not put <user> children on this IQ; the exclusion list
+    // is maintained separately. Kept for callers that pass it,
+    // and only emitted when they do.
+    const children = [];
+    if (excluded && excluded.length > 0) {
+      for (const jid of excluded) {
+        children.push(new BinaryNode('user', { jid: jidStrToObj(toNonAdJid(makeJid(jid))) }, null));
+      }
+    }
+
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'privacy',
+      to:    's.whatsapp.net',
+      type:  'set'
+    }, [
+      new BinaryNode('privacy', {}, [
+        new BinaryNode('category', { name, value: wireValue },
+          children.length > 0 ? children : null)
+      ])
+    ]);
+
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom('changePrivacySetting: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      const text    = errNode && errNode.attrs && errNode.attrs.text;
+      throw new Boom('changePrivacySetting: server rejected ' + name + '=' + wireValue +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    // The change is folded into the cached copy and the whole thing handed back
+    // rather than making the caller re-query.
+    const key = PRIVACY_WIRE_TO_KEY[name];
+    this._privacySettings = Object.assign({}, this._privacySettings || {},
+      { [key]: wireValue });
+    return this._privacySettings;
+  }
+
+  // Resolve what the caller typed to what this particular setting accepts.
+  //
+  // The allowed set differs per setting — read receipts are all-or-none, online
+  // is all-or-match-last-seen — so "contacts" is right for one and meaningless
+  // for another. Sending a meaningless one gets no reply at all.
+  _privacyWireValue(name, value) {
+    const allowed = PRIVACY_ALLOWED_VALUES[name];
+    const raw     = String(value == null ? '' : value).trim().toLowerCase();
+    const perName = PRIVACY_VALUE_ALIASES_BY_NAME[name] || {};
+    const mapped  = allowed && allowed.includes(raw)
+      ? raw
+      : (perName[raw] || PRIVACY_VALUE_ALIASES[raw] || raw);
+
+    if (allowed && !allowed.includes(mapped)) {
+      throw new Boom('changePrivacySetting: "' + value + '" is not a value ' +
+        name + ' accepts — use one of ' + allowed.join(', ') +
+        '. The server ignores anything else without answering.', { statusCode: 400 });
+    }
+    return mapped;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // MESSAGING — editMessage, deleteMessage, sendStatus, forwardMessage
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Edit a sent message
+  async editMessage(origMsgId, chatJid, newText, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.editMessage(origMsgId, chatJid, newText, opts);
+  }
+
+  /**
+   * Send a message this library has no method for.
+   *
+   * `message` is an encoded `Message` protobuf, built with whatever schema
+   * tooling you use. It is encrypted and fanned out exactly as the built-in
+   * sends are; only the content is yours.
+   *
+   * The stanza still has to say what kind of message it carries, which the
+   * server reads without decrypting anything:
+   *
+   * @param {string} to
+   * @param {Buffer} message
+   * @param {object} [opts]
+   * @param {'text'|'media'|'poll'|'reaction'} [opts.type]  stanza type, default 'text'
+   * @param {string} [opts.mediaType]  for 'media': image, video, audio, ptt,
+   *                                   document, sticker, gif, vcard, location…
+   * @param {'creation'|'vote'} [opts.pollType]  for 'poll'
+   * @param {string} [opts.edit]       the edit attribute: '1' edit, '2' pin,
+   *                                   '7' revoke, '8' admin revoke
+   * @param {boolean} [opts.hide]      tell recipients to show nothing if it
+   *                                   cannot be decrypted
+   * @param {string} [opts.id]         message id, generated when absent
+   */
+  async sendRawMessage(to, message, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendRaw(to, message, opts);
+  }
+
+  /**
+   * Vote on a poll.
+   *
+   * @param {string} chatJid   the chat the poll is in
+   * @param {object} poll
+   * @param {string} poll.id         the poll message's id
+   * @param {string} poll.sender     who sent the poll (their JID, as the poll
+   *                                 message's sender; our own for a poll we sent)
+   * @param {boolean} [poll.fromMe]  the poll is ours
+   * @param {Buffer} poll.encKey     the poll's message secret: `decoded.encKey`
+   *                                 on a received poll, or what `sendPoll` returned
+   * @param {string[]} selected      the option texts to vote for; empty clears the vote
+   */
+  async sendPollVote(chatJid, poll, selected, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    const MS = require('./messages/MessageSecret');
+    const { encodePollUpdateMessage, encodePollVoteMessage } = require('./proto/MessageProto');
+    if (!poll || !poll.id) throw new Boom('sendPollVote: the poll\'s message id is required', { statusCode: 400 });
+    const chat = makeJid(chatJid);
+    const isGroup = chat.endsWith('@g.us');
+    const voter = this._addOnSenderFor(poll.sender, opts);
+    const pollSender = poll.fromMe ? voter : poll.sender;
+    if (!pollSender) throw new Boom('sendPollVote: poll.sender is required for a poll somebody else sent', { statusCode: 400 });
+    const sealed = MS.encryptSecret({
+      type: MS.SECRET_TYPE.POLL_VOTE,
+      messageSecret: poll.encKey || poll.messageSecret,
+      targetId: poll.id, targetSender: pollSender, sender: voter,
+      plaintext: encodePollVoteMessage(MS.hashPollOptions(selected))
+    });
+    const key = { remoteJid: chat, fromMe: !!poll.fromMe, id: poll.id };
+    if (isGroup && !poll.fromMe) key.participant = toNonAdJid(String(poll.sender));
+    const message = encodePollUpdateMessage({ key, encPayload: sealed.encPayload, encIv: sealed.encIv });
+    return this._sender.sendRaw(chat, message,
+      Object.assign({}, opts, { type: 'poll', pollType: 'vote', hide: true }));
+  }
+
+  // Which of our own addresses an add-on is sent as. It has to be in the same
+  // space as the message it acts on: a target addressed by LID is answered
+  // from our LID, one addressed by phone number from our number.
+  _addOnSenderFor(targetSender, opts) {
+    if (opts && opts.sender) return toNonAdJid(String(opts.sender));
+    const lid = this._myLid ? toNonAdJid(String(this._myLid)) : null;
+    if (lid && String(targetSender || '').endsWith('@lid')) return lid;
+    return toNonAdJid(this._ownDeviceJid());
+  }
+
+  /**
+   * Pin a message for everyone in a chat, or unpin it.
+   *
+   * @param {string} chatJid
+   * @param {object} target   `{ id, fromMe, participant? }` — the message, and
+   *                          in a group who sent it when it is not ours
+   * @param {object} [opts]
+   * @param {boolean} [opts.pin]        false unpins; default true
+   * @param {number} [opts.durationSecs] how long it stays pinned: 86400,
+   *                                     604800 (default) or 2592000
+   */
+  async pinMessage(chatJid, target, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    opts = opts || {};
+    if (!target || !target.id) throw new Boom('pinMessage: the target message id is required', { statusCode: 400 });
+    const { encodePinInChatMessage } = require('./proto/MessageProto');
+    const chat = makeJid(chatJid);
+    const key = { remoteJid: chat, fromMe: !!target.fromMe, id: target.id };
+    if (chat.endsWith('@g.us') && !target.fromMe && target.participant) {
+      key.participant = toNonAdJid(String(target.participant));
+    }
+    const message = encodePinInChatMessage({
+      key, pin: opts.pin !== false,
+      durationSecs: opts.durationSecs || 604800
+    });
+    return this._sender.sendRaw(chat, message, { id: opts.id, type: 'text', edit: '2' });
+  }
+
+  /** Unpin a message pinned for everyone. */
+  async unpinMessage(chatJid, target, opts) {
+    return this.pinMessage(chatJid, target, Object.assign({}, opts, { pin: false }));
+  }
+
+  /**
+   * Open an add-on that is sealed under another message's secret.
+   *
+   * A reaction or a comment in a community announcement group, a response to
+   * an event and an encrypted edit all arrive naming their target and carrying
+   * ciphertext. The key comes from the target message's secret
+   * (`decoded.messageSecret` on that message), who sent the target, and who
+   * sent the add-on.
+   *
+   * @param {object} msg   the `message` event payload, or its `decoded`
+   * @param {object} opts
+   * @param {Buffer} opts.messageSecret  the target message's 32-byte secret
+   * @param {string} [opts.targetSender] who sent the target; defaults to the
+   *                                     key's participant, or its chat in a DM
+   * @param {string} [opts.sender]       who sent the add-on; defaults to the
+   *                                     message's sender
+   * @returns {{type: string, targetKey: object, plaintext: Buffer, decoded: object|null}}
+   *          `plaintext` is the protobuf inside; `decoded` is it read as a
+   *          Message where that is what it is (an edit, a comment)
+   */
+  decryptSecretMessage(msg, opts) {
+    opts = opts || {};
+    const MS = require('./messages/MessageSecret');
+    const d = (msg && msg.decoded) ? msg.decoded : msg;
+    const LABEL = {
+      encReaction: MS.SECRET_TYPE.REACTION,
+      encComment: MS.SECRET_TYPE.COMMENT,
+      encEventResponse: MS.SECRET_TYPE.EVENT_RESPONSE
+    };
+    if (!d || !(d.type in LABEL || d.type === 'secretEncrypted')) {
+      throw new Boom('decryptSecretMessage: this message is not an encrypted add-on', { statusCode: 400 });
+    }
+    const type = d.type === 'secretEncrypted'
+      ? MS.SECRET_ENC_TYPE[d.secretEncType]
+      : LABEL[d.type];
+    if (!type) throw new Boom('decryptSecretMessage: unsupported secretEncType ' + d.secretEncType, { statusCode: 400 });
+    const key = d.targetKey || {};
+    if (!key.id) throw new Boom('decryptSecretMessage: the add-on does not name its target', { statusCode: 400 });
+
+    const sender = toNonAdJid(String(
+      opts.sender || (msg && msg.participant) || (msg && msg.from) || ''));
+    if (!sender || sender.startsWith('@')) {
+      throw new Boom('decryptSecretMessage: cannot tell who sent this — pass opts.sender', { statusCode: 400 });
+    }
+    // Who sent the target. Ours: the add-on's own sender. In a direct chat:
+    // the chat the key names. In a group: the participant the key names.
+    const chat = String((msg && (msg.chat || msg.from)) || key.remoteJid || '');
+    const direct = chat.endsWith('@s.whatsapp.net') || chat.endsWith('@lid');
+    const targetSender = toNonAdJid(String(
+      opts.targetSender || (key.fromMe ? sender
+        : direct ? (key.remoteJid || key.participant || '')
+        : (key.participant || key.remoteJid || ''))));
+
+    const plaintext = MS.decryptSecret({
+      type, messageSecret: opts.messageSecret || opts.encKey,
+      targetId: key.id, targetSender, sender,
+      encPayload: d.encPayload, encIv: d.encIv
+    });
+
+    const out = { type: d.type, secretType: type, targetKey: key, plaintext, decoded: null };
+    const { decodeFields, decodeMessageContainer } = require('./proto/MessageProto');
+    try {
+      if (d.type === 'encReaction') {
+        // ReactionMessage { key = 1, text = 2, senderTimestampMS = 4 }
+        const f = decodeFields(plaintext);
+        out.text = Buffer.isBuffer(f[2]) ? f[2].toString('utf8') : '';
+        if (typeof f[4] === 'number') out.senderTimestampMs = f[4];
+      } else if (d.type === 'encEventResponse') {
+        // EventResponseMessage { response = 1 (1 going, 2 not going, 3 maybe),
+        //                        timestampMS = 2, extraGuestCount = 3 }
+        const f = decodeFields(plaintext);
+        out.response = ({ 1: 'going', 2: 'not_going', 3: 'maybe' })[f[1]] || 'unknown';
+        if (typeof f[2] === 'number') out.timestampMs = f[2];
+        if (typeof f[3] === 'number') out.extraGuestCount = f[3];
+      } else if (d.type === 'encComment') {
+        // CommentMessage { message = 1, targetMessageKey = 2 }
+        const f = decodeFields(plaintext);
+        if (Buffer.isBuffer(f[1])) { out.messageRaw = f[1]; out.decoded = decodeMessageContainer(f[1]); }
+      } else {
+        out.decoded = decodeMessageContainer(plaintext);
+      }
+    } catch (_) { /* the plaintext is still there to read */ }
+    return out;
+  }
+
+  /** A reaction sent in a community announcement group. See `decryptSecretMessage`. */
+  decryptReaction(msg, opts) {
+    const d = (msg && msg.decoded) ? msg.decoded : msg;
+    if (!d || d.type !== 'encReaction') throw new Boom('decryptReaction: this is not an encrypted reaction', { statusCode: 400 });
+    return this.decryptSecretMessage(msg, opts);
+  }
+
+  /** A comment on a community announcement. See `decryptSecretMessage`. */
+  decryptComment(msg, opts) {
+    const d = (msg && msg.decoded) ? msg.decoded : msg;
+    if (!d || d.type !== 'encComment') throw new Boom('decryptComment: this is not an encrypted comment', { statusCode: 400 });
+    return this.decryptSecretMessage(msg, opts);
+  }
+
+  /** A response to an event. See `decryptSecretMessage`. */
+  decryptEventResponse(msg, opts) {
+    const d = (msg && msg.decoded) ? msg.decoded : msg;
+    if (!d || d.type !== 'encEventResponse') throw new Boom('decryptEventResponse: this is not an event response', { statusCode: 400 });
+    return this.decryptSecretMessage(msg, opts);
+  }
+
+  // Delete a message
+  // fromMe: whether the message was sent by us
+  // forEveryone: true = revoke for all, false = delete locally only
+  async deleteMessage(origMsgId, chatJid, fromMe, forEveryone, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.deleteMessage(origMsgId, chatJid, fromMe, forEveryone, opts);
+  }
+
+  // ─── AB props — the server's own feature flags ────────────────────────────
+  //
+  // Every WhatsApp client asks the server which experiments and configuration
+  // values apply to this account and then gates behaviour on the answer: how
+  // many bytes an identity hash is truncated to, whether the LID migration has
+  // started here, what sampling weight each telemetry event carries. A client
+  // that never asks runs on guessed defaults wherever the server has an
+  // opinion — and never asking is itself unlike the app, which asks on every
+  // login.
+  //
+  //   <iq xmlns="abt" to="s.whatsapp.net" type="get">
+  //     <props protocol="1" [hash="..."] [refresh_id="..."]/>
+  //   </iq>
+  //
+  // The reply carries a hash of the set it returned. Sending that hash back on
+  // the next request asks for a delta rather than the whole table, which is
+  // what the app does once it has synced. The hash is kept for the session
+  // only — a fresh process asks for the full set, exactly as a fresh install
+  // does — so nothing here has to be persisted or migrated.
+  //
+  // Values come back as strings because that is what the wire carries. Typing
+  // them per prop would need a table this side does not have, and guessing
+  // would be wrong more often than it is useful; `abPropInt` and `abPropBool`
+  // are there for the two readings that are worth having.
+
+  /**
+   * Sync this account's AB props.
+   *
+   * Served from the session cache unless `force` is set. A reply the server
+   * marks `delta_update` is merged onto what is already held rather than
+   * replacing it, which is the whole point of sending the hash.
+   *
+   * @param   {object}  [opts]
+   * @param   {boolean} [opts.force]      re-ask even when a set is cached
+   * @param   {string}  [opts.refreshId]  the emergency-push branch. The server
+   *          announces a refresh id when a global update has to propagate at
+   *          once; sending it takes the place of the hash.
+   * @returns {Promise<{hash: string|null, abKey: string|null,
+   *                    refresh: number|null, refreshId: string|null,
+   *                    delta: boolean, props: Object<string,string>,
+   *                    sampling: Object<string,number>}>}
+   */
+  async queryAbProps(opts) {
+    opts = opts || {};
+    if (this._abProps && !opts.force && opts.refreshId == null) return this._abProps;
+
+    const propsAttrs = { protocol: '1' };
+    // One or the other, never both: a refresh id names a specific update to
+    // fetch, and a hash asks for whatever has changed since it. Sending both
+    // asks two different questions in one stanza.
+    if (opts.refreshId != null) propsAttrs.refresh_id = String(opts.refreshId);
+    else if (this._abPropsHash)  propsAttrs.hash       = this._abPropsHash;
+
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'abt'
+    }, [new BinaryNode('props', propsAttrs, null)]));
+
+    if (!resp) throw new Boom('queryAbProps: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('queryAbProps: server rejected the request' +
+        (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    const parsed = this._parseAbProps(findChild(resp, 'props'));
+
+    // A delta names only what moved. Replacing the cache with it would drop
+    // every prop the server saw no reason to repeat.
+    if (parsed.delta && this._abProps) {
+      parsed.props    = Object.assign({}, this._abProps.props,    parsed.props);
+      parsed.sampling = Object.assign({}, this._abProps.sampling, parsed.sampling);
+    }
+
+    if (parsed.hash) this._abPropsHash = parsed.hash;
+    this._abProps = parsed;
+    _whaDbg('[DBG] AB_PROPS ' + (parsed.delta ? 'delta' : 'full') +
+      ' props=' + Object.keys(parsed.props).length +
+      ' sampling=' + Object.keys(parsed.sampling).length +
+      (parsed.hash ? ' hash=' + parsed.hash : ''));
+    return parsed;
+  }
+
+  // <props hash ab_key refresh refresh_id delta_update>
+  //   <prop config_code="..." config_value="..."/>     an experiment value
+  //   <prop event_code="..."  sampling_weight="..."/>  a telemetry weight
+  // </props>
+  //
+  // The two shapes share a tag and are told apart by which attributes they
+  // carry, so each child is tried as an experiment first and as a sampling
+  // entry second. A child that is neither is skipped rather than allowed to
+  // fail the whole sync — an unknown shape is a prop this version has not
+  // learned about, not a broken reply.
+  _parseAbProps(propsNode) {
+    const out = {
+      hash:      null,
+      abKey:     null,
+      refresh:   null,
+      refreshId: null,
+      delta:     false,
+      props:     {},
+      sampling:  {}
+    };
+    if (!propsNode || !propsNode.attrs) return out;
+
+    const a = propsNode.attrs;
+    out.hash      = a.hash       ? String(a.hash)       : null;
+    out.abKey     = a.ab_key     ? String(a.ab_key)     : null;
+    out.refreshId = a.refresh_id ? String(a.refresh_id) : null;
+
+    const refresh = Number(a.refresh);
+    if (Number.isFinite(refresh) && refresh > 0) out.refresh = refresh;
+
+    // The server writes this as a string, and "false" is a true string.
+    out.delta = a.delta_update === 'true' || a.delta_update === true || a.delta_update === '1';
+
+    const children = Array.isArray(propsNode.content) ? propsNode.content : [];
+    for (const child of children) {
+      if (!child || child.description !== 'prop' || !child.attrs) continue;
+      const c = child.attrs;
+
+      if (c.config_code != null && c.config_value != null) {
+        out.props[String(c.config_code)] = String(c.config_value);
+        continue;
+      }
+
+      if (c.event_code != null && c.sampling_weight != null) {
+        const code   = Number(c.event_code);
+        const weight = Number(c.sampling_weight);
+        // Bounds the app itself applies. A code below 1 names no event, and a
+        // weight outside the range is not a weight — both mean this entry was
+        // misread rather than that the server sent something exotic.
+        if (Number.isFinite(code) && code >= 1 &&
+            Number.isFinite(weight) && weight >= 0 && weight <= 1000000) {
+          out.sampling[String(code)] = weight;
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * One AB prop as a string, or `fallback` when the server has not set it.
+   *
+   * Props are addressed by their numeric code, which is what the wire uses.
+   * Reading one before `queryAbProps` has run returns the fallback rather than
+   * throwing: a caller gating on a flag wants the default, not an exception.
+   *
+   * @param   {number|string} code
+   * @param   {string|null}   [fallback=null]
+   * @returns {string|null}
+   */
+  abProp(code, fallback) {
+    const value = this._abProps && this._abProps.props[String(code)];
+    return value === undefined || value === null ? (fallback === undefined ? null : fallback) : value;
+  }
+
+  /** The same, read as an integer. Anything unparseable gives the fallback. */
+  abPropInt(code, fallback) {
+    const raw = this.abProp(code, null);
+    const n   = Number(raw);
+    return raw === null || !Number.isFinite(n) ? (fallback === undefined ? null : fallback) : n;
+  }
+
+  /**
+   * The same, read as a flag.
+   *
+   * The wire spells these as "1"/"0" and as "true"/"false" depending on the
+   * prop, so both are understood; anything else gives the fallback rather than
+   * being coerced, since a prop carrying a version string is not a flag.
+   */
+  abPropBool(code, fallback) {
+    const raw = this.abProp(code, null);
+    if (raw === '1' || raw === 'true')  return true;
+    if (raw === '0' || raw === 'false') return false;
+    return fallback === undefined ? null : fallback;
+  }
+
+  // ─── Contact sync — telling the server which numbers are in the book ──────
+  //
+  // The app uploads its address book on first launch and re-syncs deltas
+  // afterwards, which is how it learns who is reachable and how the server
+  // learns who this account knows. whalibmob has had the whole usync machinery
+  // for device discovery all along and never used it for this, so an account
+  // could send to a hundred strangers having never synced a single contact —
+  // a shape nothing on a phone produces.
+  //
+  // This is the same <iq xmlns="usync"> the device path builds, with the
+  // contact protocol on its own and the mode and context that name an address
+  // book upload rather than a lookup.
+
+  /**
+   * Sync contacts, and learn which of them are on WhatsApp.
+   *
+   * @param   {string[]} phones  E.164 numbers. A leading `+` is added when
+   *          missing, since that is the only form the contact protocol takes.
+   * @param   {object}   [opts]
+   * @param   {'full'|'delta'|'query'} [opts.mode]  `full` — the whole book, what
+   *          the app sends on first launch; `delta` — what changed since;
+   *          `query` — a lookup that claims nothing about the book. Defaults to
+   *          `full`.
+   * @param   {string}   [opts.context]  defaults to `registration` for a full
+   *          sync (the app's own first-launch context) and `interactive`
+   *          otherwise.
+   * @param   {number}   [opts.chunkSize=500]  numbers per IQ.
+   * @returns {Promise<{registered: string[], unregistered: string[],
+   *                    jids: Object<string,string>}>}
+   *          `registered` and `unregistered` hold the numbers as passed in;
+   *          `jids` maps each registered number to the JID the server gave it.
+   */
+  async syncContacts(phones, opts) {
+    if (!this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    // _devMgr is torn down on close and rebuilt on init. Saying so beats the
+    // null dereference a caller would otherwise get from a session that is
+    // connected but has been through a teardown.
+    if (!this._devMgr) throw new Boom('syncContacts: no device manager — the session is not initialised', { statusCode: 428 });
+    if (!Array.isArray(phones)) throw new Boom('syncContacts: phones must be an array', { statusCode: 400 });
+
+    opts = opts || {};
+    const mode      = opts.mode || 'full';
+    const context   = opts.context || (mode === 'full' ? 'registration' : 'interactive');
+    const chunkSize = Number(opts.chunkSize) > 0 ? Number(opts.chunkSize) : 500;
+
+    const { USyncQuery, USyncUser } = require('./WAUSync');
+
+    // Normalise once, and keep the caller's spelling to answer in. Duplicates
+    // are dropped here rather than sent: the server counts what it is asked
+    // about, and asking twice about one number in one book is not what a
+    // phone does.
+    const wanted = [];
+    const seen   = new Set();
+    for (const raw of phones) {
+      const digits = String(raw || '').replace(/[^\d]/g, '');
+      if (!digits || seen.has(digits)) continue;
+      seen.add(digits);
+      wanted.push({ input: String(raw), digits });
+    }
+
+    const out = { registered: [], unregistered: [], jids: {} };
+    if (wanted.length === 0) return out;
+
+    for (let i = 0; i < wanted.length; i += chunkSize) {
+      const chunk = wanted.slice(i, i + chunkSize);
+
+      const query = new USyncQuery()
+        .withMode(mode)
+        .withContext(context)
+        .withContactProtocol();
+      for (const c of chunk) query.withUser(new USyncUser().withPhone('+' + c.digits));
+
+      const parsed = await this._devMgr.executeUSyncQuery(query);
+
+      // A chunk the server did not answer leaves its numbers unclassified
+      // rather than marked absent. Reporting "not on WhatsApp" for a timeout
+      // is the one wrong answer here — a caller acts on it.
+      if (!parsed || !Array.isArray(parsed.list)) {
+        _whaDbg('[DBG] CONTACT_SYNC chunk ' + (i / chunkSize) + ' unanswered — ' +
+          chunk.length + ' numbers left unclassified');
+        continue;
+      }
+
+      // The reply is keyed by JID, so match each entry back to the number it
+      // came from by the JID's user part.
+      const byUser = new Map();
+      for (const entry of parsed.list) {
+        if (!entry || !entry.id) continue;
+        const user = String(entry.id).split('@')[0].split(':')[0];
+        byUser.set(user, entry);
+      }
+
+      for (const c of chunk) {
+        const entry = byUser.get(c.digits);
+        if (!entry) continue;                    // unclassified, as above
+        if (entry.contact === true) {
+          out.registered.push(c.input);
+          out.jids[c.input] = String(entry.id);
+        } else {
+          out.unregistered.push(c.input);
+        }
+      }
+    }
+
+    _whaDbg('[DBG] CONTACT_SYNC mode=' + mode + ' context=' + context +
+      ' asked=' + wanted.length + ' on=' + out.registered.length +
+      ' off=' + out.unregistered.length);
+    return out;
+  }
+
+  // ─── Email on the account — bind a recovery address and verify it ──────────
+  //
+  // An account can carry an email address, used to get back in when the number
+  // is lost or a two-step PIN is forgotten. It is not a way to receive the
+  // registration code: there is no email delivery at the /code stage — the
+  // address is bound on an account that is already registered and connected,
+  // and verified with a code the server sends to the inbox.
+  //
+  // The whole exchange is <iq xmlns="urn:xmpp:whatsapp:account"> over the live
+  // connection, never the HTTP /code path, and the server only answers it for a
+  // primary (mobile) session. A companion (web) link is refused outright, so
+  // the mode is checked here rather than left to surface as a bare 403.
+  //
+  //   status   <iq type="get"><email/></iq>
+  //   bind     <iq type="set"><email><email_address>a@b.c</email_address></email></iq>
+  //   request  <iq type="set"><verify_email><lg>en</lg><lc>US</lc></verify_email></iq>
+  //   verify   <iq type="get"><verify_email><code>123456</code></verify_email></iq>
+  //   confirm  <iq type="set"><confirm_email><context>settings</context></confirm_email></iq>
+  // `context` belongs to confirm_email, not the email binding node. Code
+  // verification replies carry verify_email/code_match, not email/do_verify.
+
+  _assertEmailChannel(what) {
+    if (!this._connected) throw new Boom(what + ': Not connected', { statusCode: 428 });
+    if (this._mode === 'web') {
+      throw new Boom(what + ': the account email is a primary-account feature — ' +
+        'a companion (web) link cannot bind or verify it', { statusCode: 405 });
+    }
+  }
+
+  _emailNoReply(what, code) {
+    const reason = code === 'IQ_TIMEOUT'
+      ? 'no matching reply within 32 seconds'
+      : code === 'IQ_DISCONNECTED' ? 'connection closed before the reply'
+      : 'request outcome could not be confirmed';
+    const error = new Boom(what + ': ' + reason +
+      '; outcome unknown. Check getEmailStatus() before repeating a change or requesting another code.',
+      { statusCode: code === 'IQ_TIMEOUT' ? 408 : code === 'IQ_DISCONNECTED' ? 428 : 500 });
+    error.code = code === 'IQ_TIMEOUT' ? 'EMAIL_IQ_TIMEOUT'
+      : code === 'IQ_DISCONNECTED' ? 'EMAIL_IQ_DISCONNECTED' : 'EMAIL_IQ_UNCERTAIN';
+    error.operation = what;
+    error.outcomeUnknown = true;
+    return error;
+  }
+
+  async _sendEmailIq(what, node) {
+    let resp;
+    try {
+      resp = await this._sendIq(node, {
+        timeoutMs: EMAIL_IQ_TIMEOUT_MS, rejectOnNoReply: true
+      });
+    } catch (error) {
+      throw this._emailNoReply(what, error && error.code);
+    }
+    if (!resp) throw this._emailNoReply(what);
+    const attrs = resp.attrs || {};
+    const from = attrs.from;
+    const server = from === undefined || from === 's.whatsapp.net' || from === '@s.whatsapp.net' ||
+      (from && typeof from === 'object' && !from.user && !from.device && from.server === 's.whatsapp.net');
+    if (resp.description !== 'iq' || String(attrs.id) !== String(node.attrs.id) ||
+        !server || (attrs.type !== 'result' && attrs.type !== 'error')) {
+      throw this._emailNoReply(what);
+    }
+    if (attrs.type === 'error') throw this._emailError(what, resp);
+    return resp;
+  }
+
+  // Turn one of the server's numeric email error codes into words, so a 536
+  // reads as "wrong code" rather than a bare number the caller has to look up.
+  _emailError(what, resp) {
+    const errNode = findChild(resp, 'error');
+    const code    = errNode && errNode.attrs && errNode.attrs.code
+      ? String(errNode.attrs.code) : '';
+    const text = {
+      '403': 'not allowed for this account',
+      '534': 'locked out — too many attempts, try again later',
+      '535': 'the code has expired — request a new one',
+      '536': 'the code is incorrect',
+      '537': 'too many wrong codes — request a new one'
+    }[code];
+    return new Boom(what + ': server rejected the request' +
+      (code ? ' (' + code + (text ? ' — ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+  }
+
+  _parseEmailStatus(resp) {
+    const emailNode = findChild(resp, 'email');
+    if (!emailNode) return { email: null, verified: false, confirmed: false };
+    const addr = findChild(emailNode, 'email_address');
+    const conf = findChild(emailNode, 'confirmed');
+    const verified = findChild(emailNode, 'verified');
+    const addrBuf = addr ? getNodeContent(addr) : null;
+    const confBuf = conf ? getNodeContent(conf) : null;
+    const verifiedBuf = verified ? getNodeContent(verified) : null;
+    return {
+      email:     addrBuf ? addrBuf.toString('utf8') : null,
+      // The current account response uses an element value. Keep the legacy
+      // attribute fallback only when that element is absent.
+      verified:  verified ? !!verifiedBuf && verifiedBuf.toString('utf8') === 'true'
+        : !!(emailNode.attrs && emailNode.attrs.verified === 'true'),
+      confirmed: confBuf ? confBuf.toString('utf8') === 'true' : false
+    };
+  }
+
+  /**
+   * Read the email currently bound to the account.
+   * @returns {Promise<{email: string|null, verified: boolean, confirmed: boolean}>}
+   */
+  async getEmailStatus() {
+    this._assertEmailChannel('getEmailStatus');
+    const resp = await this._sendEmailIq('getEmailStatus', new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'urn:xmpp:whatsapp:account'
+    }, [new BinaryNode('email', {}, null)]));
+    return this._parseEmailStatus(resp);
+  }
+
+  /**
+   * Bind (or rebind) an email address to the account. The address is not
+   * verified by this call — request a code with requestEmailCode() next.
+   * @param   {string} email
+   * @param   {object} [opts]  Legacy context option is accepted, not sent here.
+   * @returns {Promise<{email: string|null, verified: boolean, confirmed: boolean}>}
+   */
+  async setEmail(email, opts) {
+    this._assertEmailChannel('setEmail');
+    opts = opts || {};
+    const addr = String(email == null ? '' : email).trim();
+    if (!addr || addr.length > 320) {
+      throw new Boom('setEmail: email must be between 1 and 320 characters', { statusCode: 400 });
+    }
+    const emailChildren = [new BinaryNode('email_address', {}, Buffer.from(addr, 'utf8'))];
+    const resp = await this._sendEmailIq('setEmail', new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'urn:xmpp:whatsapp:account'
+    }, [new BinaryNode('email', {}, emailChildren)]));
+    return this._parseEmailStatus(resp);
+  }
+
+  /**
+   * Ask the server to send a verification code to the bound address.
+   * @param   {object} [opts]  { lg?: language (2-3 chars), lc?: country (2-3 chars) }
+   *                           Defaults to en/US. These only pick the language the
+   *                           email is written in; the code itself is the same.
+   * @returns {Promise<boolean>}  true once the server accepts the request.
+   */
+  async requestEmailCode(opts) {
+    this._assertEmailChannel('requestEmailCode');
+    opts = opts || {};
+    const lg = String(opts.lg || opts.language || 'en');
+    const lc = String(opts.lc || opts.locale  || 'US');
+    for (const [name, val] of [['lg', lg], ['lc', lc]]) {
+      if (val.length < 2 || val.length > 3) {
+        throw new Boom('requestEmailCode: ' + name + ' must be 2-3 characters', { statusCode: 400 });
+      }
+    }
+    const resp = await this._sendEmailIq('requestEmailCode', new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'urn:xmpp:whatsapp:account'
+    }, [new BinaryNode('verify_email', {}, [
+      new BinaryNode('lg', {}, Buffer.from(lg, 'utf8')),
+      new BinaryNode('lc', {}, Buffer.from(lc, 'utf8'))
+    ])]));
+    return true;
+  }
+
+  /**
+   * Submit the six-digit code the server emailed.
+   * @param   {string} code  exactly six digits (separators are stripped)
+   * @returns {Promise<{verified: boolean, autoVerifyFailed: boolean, email: string|null}>}
+   */
+  async verifyEmailCode(code) {
+    this._assertEmailChannel('verifyEmailCode');
+    const digits = String(code == null ? '' : code).replace(/\D/g, '');
+    if (digits.length !== 6) throw new Boom('verifyEmailCode: code must be exactly 6 digits', { statusCode: 400 });
+    const resp = await this._sendEmailIq('verifyEmailCode', new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'urn:xmpp:whatsapp:account'
+    }, [new BinaryNode('verify_email', {}, [
+      new BinaryNode('code', {}, Buffer.from(digits, 'utf8'))
+    ])]));
+    const verify = findChild(resp, 'verify_email');
+    const match = verify && findChild(verify, 'code_match');
+    const content = match && getNodeContent(match);
+    const verdict = content && content.toString('utf8');
+    if (verdict !== 'true' && verdict !== 'false') {
+      throw this._emailNoReply('verifyEmailCode');
+    }
+    const wait = findChild(verify, 'wait_time');
+    const waitBuf = wait && getNodeContent(wait);
+    const seconds = waitBuf && /^(0|[1-9][0-9]*)$/.test(waitBuf.toString('utf8'))
+      ? Number(waitBuf.toString('utf8')) : null;
+    return {
+      verified: verdict === 'true',
+      // auto_verify belongs to the bind response, not the OTP verdict. Retain
+      // the public property for callers of earlier versions.
+      autoVerifyFailed: false,
+      email: null,
+      ...(Number.isSafeInteger(seconds) ? { waitTimeSeconds: seconds } : {})
+    };
+  }
+
+  /**
+   * Confirm email ownership — the handshake after a successful verifyEmailCode().
+   * @param   {object} [opts]  { context?: 'settings' | 'onboarding' }
+   * @returns {Promise<boolean>}  true once the server accepts it.
+   */
+  async confirmEmail(opts) {
+    this._assertEmailChannel('confirmEmail');
+    opts = opts || {};
+    const context = opts.context === undefined ? 'settings' : opts.context;
+    if (context !== 'settings' && context !== 'onboarding') {
+      throw new Boom('confirmEmail: context must be settings or onboarding', { statusCode: 400 });
+    }
+    const children = [new BinaryNode('context', {}, Buffer.from(context, 'utf8'))];
+    const resp = await this._sendEmailIq('confirmEmail', new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'urn:xmpp:whatsapp:account'
+    }, [new BinaryNode('confirm_email', {}, children)]));
+    return true;
+  }
+
+  // ─── Terms-of-Service notices ─────────────────────────────────────────────
+  //
+  // WhatsApp gates some surfaces on the account having accepted a given legal
+  // notice — a Terms update, a privacy-policy change, a regional disclosure.
+  // The app pulls the acceptance state, shows the ones that are outstanding,
+  // and posts back what the user accepted.
+  //
+  //   read    <iq xmlns="tos" type="get"><request><notice id="..."/></request></iq>
+  //   accept  <iq xmlns="tos" type="set"><request type="session_update">
+  //             <notice id="..."/></request></iq>
+  //   clear   <iq xmlns="tos" type="set"><delete id="..."/></iq>
+  //
+  // The reply's `state` attribute reads backwards from how it looks: it is
+  // present and "false" for a notice that has NOT been accepted, and absent
+  // for one that has. Treating a missing attribute as "unknown" would report
+  // every accepted notice as outstanding.
+
+  /**
+   * Read the acceptance state of one or more notices.
+   *
+   * @param   {string[]} noticeIds
+   * @returns {Promise<{refresh: number|null,
+   *                    notices: Array<{id: string, accepted: boolean}>}>}
+   *          `refresh` is how many seconds the server suggests waiting before
+   *          asking again.
+   */
+  // The notice the native client checks on its first login — the general WhatsApp
+  // terms. Captured post-<success> as <iq xmlns='tos' type='get'><request>
+  // <notice id='20210210'/></request>.
+  static get FIRST_LOGIN_TOS_NOTICE() { return '20210210'; }
+
+  // Fire-and-forget first-login terms check. Queries the standard notice and, if
+  // the server reports it outstanding, accepts it. Every failure is swallowed:
+  // the account works whether or not this round-trip lands, exactly as the other
+  // on-connect syncs do.
+  _acceptLoginTos() {
+    const notice = WhalibmobClient.FIRST_LOGIN_TOS_NOTICE;
+    this.queryTosNotices([notice])
+      .then((parsed) => {
+        const outstanding = parsed.notices.filter(n => !n.accepted).map(n => n.id);
+        if (outstanding.length) return this.acceptTosNotices(outstanding);
+      })
+      .then(() => _whaDbg('[DBG] TOS first-login check done'))
+      .catch(err => _whaDbg('[DBG] TOS first-login check failed: ' + (err && err.message)));
+  }
+
+  async queryTosNotices(noticeIds) {
+    if (!this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (!Array.isArray(noticeIds)) throw new Boom('queryTosNotices: noticeIds must be an array', { statusCode: 400 });
+
+    const ids = noticeIds.map(id => String(id)).filter(Boolean);
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'tos'
+    }, [new BinaryNode('request', {},
+      ids.map(id => new BinaryNode('notice', { id }, null)))]));
+
+    if (!resp) throw new Boom('queryTosNotices: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('queryTosNotices: server rejected the request' +
+        (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    const parsed = this._parseTosNotices(findChild(resp, 'tos'));
+    for (const n of parsed.notices) this._tosAccepted.set(n.id, n.accepted);
+    _whaDbg('[DBG] TOS_QUERY asked=' + ids.length + ' answered=' + parsed.notices.length +
+      ' outstanding=' + parsed.notices.filter(n => !n.accepted).length);
+    return parsed;
+  }
+
+  // <tos refresh="86400"><notice id="..." [state="false"]/>...</tos>
+  _parseTosNotices(tosNode) {
+    const out = { refresh: null, notices: [] };
+    if (!tosNode) return out;
+
+    const refresh = Number(tosNode.attrs && tosNode.attrs.refresh);
+    if (Number.isFinite(refresh) && refresh > 0) out.refresh = refresh;
+
+    const children = Array.isArray(tosNode.content) ? tosNode.content : [];
+    for (const child of children) {
+      if (!child || child.description !== 'notice' || !child.attrs || !child.attrs.id) continue;
+      const state = child.attrs.state;
+      // Only an explicit "false" means not accepted; see the note above.
+      out.notices.push({
+        id:       String(child.attrs.id),
+        accepted: !(state === 'false' || state === false)
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Accept one or more notices.
+   *
+   * @param   {string[]} noticeIds
+   * @returns {Promise<{ok: true, raw: any}>}
+   */
+  async acceptTosNotices(noticeIds) {
+    if (!this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (!Array.isArray(noticeIds) || noticeIds.length === 0) {
+      throw new Boom('acceptTosNotices: noticeIds must be a non-empty array', { statusCode: 400 });
+    }
+
+    const ids = noticeIds.map(id => String(id)).filter(Boolean);
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'tos'
+    }, [new BinaryNode('request', { type: 'session_update' },
+      ids.map(id => new BinaryNode('notice', { id }, null)))]));
+
+    if (!resp) throw new Boom('acceptTosNotices: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('acceptTosNotices: server rejected the request' +
+        (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    for (const id of ids) this._tosAccepted.set(id, true);
+    _whaDbg('[DBG] TOS_ACCEPT ' + ids.join(','));
+    return { ok: true, raw: resp };
+  }
+
+  /**
+   * Clear the accepted state of one notice, so the server asks for it again.
+   *
+   * @param   {string} noticeId
+   * @returns {Promise<{ok: true, raw: any}>}
+   */
+  async clearTosNotice(noticeId) {
+    if (!this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    const id = String(noticeId || '');
+    if (!id) throw new Boom('clearTosNotice: noticeId is required', { statusCode: 400 });
+
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'tos'
+    }, [new BinaryNode('delete', { id }, null)]));
+
+    if (!resp) throw new Boom('clearTosNotice: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('clearTosNotice: server rejected the request' +
+        (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    this._tosAccepted.set(id, false);
+    _whaDbg('[DBG] TOS_CLEAR ' + id);
+    return { ok: true, raw: resp };
+  }
+
+  /**
+   * Whether a notice is known to have been accepted.
+   *
+   * `null` means this session has not asked about it — which is not the same
+   * as "not accepted", and a caller deciding whether to prompt needs to be
+   * able to tell those apart.
+   *
+   * @param   {string} noticeId
+   * @returns {boolean|null}
+   */
+  isTosAccepted(noticeId) {
+    const known = this._tosAccepted.get(String(noticeId));
+    return known === undefined ? null : known;
+  }
+
+  // The server pushing a notice's state at us, rather than us asking:
+  // <notification type="account_sync"><tos><notice id=".." state=".."/></tos>
+  //
+  // This is how an acceptance made on another device reaches this one. It only
+  // ever adds to what is known — a push naming three notices says nothing
+  // about a fourth.
+  _handleTosNotification(tosNode) {
+    const parsed = this._parseTosNotices(tosNode);
+    if (parsed.notices.length === 0) return;
+    for (const n of parsed.notices) this._tosAccepted.set(n.id, n.accepted);
+    _whaDbg('[DBG] TOS_NOTIFICATION ' + parsed.notices
+      .map(n => n.id + '=' + (n.accepted ? 'accepted' : 'outstanding')).join(' '));
+    this.emit('tos_notices', { notices: parsed.notices });
+  }
+
+  // ─── Status / Stories ─────────────────────────────────────────────────────
+
+  // Who your Status posts go to.
+  //
+  // Returns [{ type, isDefault, list }] with the default first. type is
+  // 'contacts', 'blacklist' or 'whitelist'; list
+  // holds the JIDs the last two are built from. A server that has never been
+  // told otherwise answers nothing, which means the default: all contacts.
+  async queryStatusPrivacy() {
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'status',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, [new BinaryNode('privacy', {}, null)]);
+
+    const resp = await this._sendIq(node);
+    if (!resp || (resp.attrs && resp.attrs.type === 'error')) {
+      return [{ type: 'contacts', isDefault: true, list: [] }];
+    }
+
+    const privacyNode = findChild(resp, 'privacy');
+    const out = [];
+    if (privacyNode && Array.isArray(privacyNode.content)) {
+      for (const listNode of privacyNode.content) {
+        if (!listNode || listNode.description !== 'list' || !listNode.attrs) continue;
+        const entry = {
+          type:      listNode.attrs.type ? String(listNode.attrs.type) : 'contacts',
+          isDefault: String(listNode.attrs.default) === 'true',
+          list:      []
+        };
+        if (Array.isArray(listNode.content)) {
+          for (const u of listNode.content) {
+            if (u && u.description === 'user' && u.attrs && u.attrs.jid) {
+              entry.list.push(String(u.attrs.jid));
+            }
+          }
+        }
+        // The default is always reported first.
+        if (entry.isDefault) out.unshift(entry); else out.push(entry);
+      }
+    }
+    return out.length ? out : [{ type: 'contacts', isDefault: true, list: [] }];
+  }
+
+  // Resolve the status privacy settings into the JIDs a post actually goes to,
+  // a whitelist is the list itself, anything else is every known contact minus
+  // the blacklist, and
+  // our own JID is added so the post lands on our own devices too.
+  //
+  // Contacts come from the synced history store — this client has no separate
+  // contact database — so a session that has not synced history yet has to be
+  // given the list explicitly.
+  async _getStatusRecipients() {
+    let privacy;
+    try {
+      privacy = (await this.queryStatusPrivacy())[0];
+    } catch (_) {
+      privacy = { type: 'contacts', list: [] };
+    }
+
+    const ownJid = String(this._store.phoneNumber) + '@s.whatsapp.net';
+    let recipients, source;
+
+    if (privacy.type === 'whitelist') {
+      recipients = privacy.list.slice();
+      source = 'whitelist';
+    } else {
+      const hist = this.getHistoryStore() || {};
+      const isPerson = (jid) => !jid.endsWith('@g.us') && !jid.endsWith('@broadcast') &&
+        !jid.endsWith('@newsletter') && !this._isOwnUser(jid);
+
+      // Contacts proper: entries the history sync gave a name to.
+      const contacts = Object.keys(hist.contacts || {}).filter(jid => {
+        const c = hist.contacts[jid];
+        return c && (c.name || c.displayName) && isPerson(jid);
+      });
+
+      // A named contact list is what WhatsApp itself posts to. When history has
+      // not brought one — a fresh session, or a sync that carried chats without
+      // names — the people you actually have conversations with are the next
+      // best thing, and far better than posting to nobody.
+      let pool = contacts;
+      source = 'contacts';
+      if (pool.length === 0) {
+        pool = Object.keys(hist.chats || {}).filter(isPerson);
+        source = 'chats';
+      }
+
+      const blocked = new Set(privacy.type === 'blacklist' ? privacy.list : []);
+      recipients = pool.filter(jid => !blocked.has(jid));
+    }
+
+    if (!recipients.some(j => this._isOwnUser(j))) recipients.push(ownJid);
+    _whaDbg('[DBG] STATUS_RECIPIENTS type=' + privacy.type + ' source=' + source +
+      ' count=' + recipients.length);
+    return recipients;
+  }
+
+  // Post a Status/Story.
+  //
+  //   sendStatus('Good morning!')                       text
+  //   sendStatus({ image: './a.jpg', caption: 'hi' })   photo
+  //   sendStatus({ video: './v.mp4' })                  video
+  //   sendStatus({ audio: './v.ogg' })                  voice
+  //
+  // opts (also accepted as fields of the object form):
+  //   recipients      post to these JIDs instead of the privacy-derived list
+  //   backgroundArgb  background colour of a text status, e.g. 0xFF25D366
+  //   textArgb, font  the rest of a text status' styling
+  //
+  // Text posted with a background or font becomes an ExtendedTextMessage, which
+  // is what carries them; plain text stays a plain conversation.
+  async sendStatus(content, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    opts = Object.assign({},
+      (content && typeof content === 'object') ? content : {},
+      opts || {});
+
+    const recipients = opts.recipients || opts.statusJidList ||
+      await this._getStatusRecipients();
+    const sendOpts = Object.assign({}, opts, { _statusRecipients: recipients });
+
+    if (opts.image) return this._sender.sendImage(STATUS_BROADCAST_JID, opts.image, sendOpts);
+    if (opts.video) return this._sender.sendVideo(STATUS_BROADCAST_JID, opts.video, sendOpts);
+    if (opts.audio) return this._sender.sendAudio(STATUS_BROADCAST_JID, opts.audio, sendOpts);
+
+    const text = (typeof content === 'string') ? content : (opts.text || opts.caption || '');
+    const styled = opts.backgroundArgb != null || opts.textArgb != null || opts.font != null;
+    if (!styled) return this._sender.sendText(STATUS_BROADCAST_JID, text, sendOpts);
+
+    const { encodeMessage, encodeExtendedText } = require('./proto/MessageProto');
+    const buf = encodeMessage('extendedText', encodeExtendedText(text, {
+      backgroundArgb: opts.backgroundArgb,
+      textArgb:       opts.textArgb,
+      font:           opts.font
+    }));
+    return this._sender._sendMessage(STATUS_BROADCAST_JID,
+      generateMessageId(), buf, 'text', sendOpts);
+  }
+
+  // Forward a message
+  // If msg is a string, forward as text.
+  // If msg is a decoded message object (from the 'message' event), re-encode the original
+  // media/text without re-uploading.
+  async forwardMessage(to, msg, contextInfo) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (typeof msg === 'string') {
+      const ctx = Object.assign({ forwardingScore: 1, isForwarded: true }, contextInfo || {});
+      return this._sender.sendText(to, msg, { contextInfo: ctx });
+    }
+    return this._sender.forwardDecodedMessage(to, msg, { contextInfo: contextInfo || {} });
+  }
+
+  // ─── Poll ─────────────────────────────────────────────────────────────────
+  //
+  // Send a WhatsApp poll (PollCreationMessage).
+  // options: array of strings (the answer choices)
+  // selectableCount: how many options a voter may pick (0 = any number)
+  // opts.id: pre-set message ID
+  // Returns: { id, encKey } — encKey is a 32-byte Buffer needed to decrypt votes
+  async sendPoll(to, question, options, selectableCount, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendPoll(to, question, options, selectableCount, opts);
+  }
+
+  /**
+   * Read a vote on a poll.
+   *
+   * A vote arrives as its own message and the ballot inside it is encrypted, so
+   * nothing about who voted for what is visible in the stanza. The key is
+   * derived from the poll's message secret — the `encKey` `sendPoll` returned,
+   * or `decoded.encKey` on a poll somebody else sent us:
+   *
+   *   key = HKDF-SHA256(secret, salt = ∅,
+   *                     info = pollId ‖ pollSender ‖ voter ‖ "Poll Vote", 32)
+   *   AAD = pollId ‖ 0x00 ‖ voter
+   *   ballot = AES-256-GCM-open(key, encIv, encPayload, AAD)
+   *
+   * The ballot names the chosen options by SHA-256 of their text, not by index
+   * or by name, so pass `options` — the poll's option strings, in any order —
+   * and the choices come back as text. Without them you get the hashes and can
+   * match them yourself.
+   *
+   * Both JIDs are taken without their device: a vote belongs to an account.
+   *
+   * This is the reference client's poll-vote decryption. Nothing here could read a vote before:
+   * `sendPoll` handed back the key and left the rest to the caller.
+   *
+   * @param {object} vote            the `message` event payload, or its `decoded`
+   * @param {object} opts
+   * @param {Buffer} opts.encKey     the poll's message secret (aka messageSecret)
+   * @param {string} [opts.voter]    who voted; defaults to the message's sender
+   * @param {string} [opts.pollSender] who sent the poll; defaults to the key's
+   *                                 remoteJid, or to the voter when the poll is
+   *                                 ours
+   * @param {string[]} [opts.options] the poll's options, to name the choices
+   * @returns {{selected: string[], selectedHashes: Buffer[], votedAt: number|null}}
+   */
+  decryptPollVote(vote, opts) {
+    opts = opts || {};
+    const d = (vote && vote.decoded) ? vote.decoded : vote;
+    if (!d || d.type !== 'pollVote') {
+      throw new Boom('decryptPollVote: this is not a vote on a poll', { statusCode: 400 });
+    }
+    if (!d.encPayload || !d.encIv) {
+      throw new Boom('decryptPollVote: the vote carries no encrypted ballot', { statusCode: 400 });
+    }
+    const secret = opts.encKey || opts.messageSecret;
+    if (!secret || secret.length !== 32) {
+      throw new Boom('decryptPollVote: the poll\'s 32-byte encKey is required — ' +
+        'it is what sendPoll returned, or decoded.encKey on a poll we received', { statusCode: 400 });
+    }
+
+    const key    = d.pollKey || {};
+    const pollId = String(key.id || '');
+    if (!pollId) throw new Boom('decryptPollVote: the vote does not name a poll', { statusCode: 400 });
+
+    // Who voted, and who the poll belongs to. `fromMe` on the key means the
+    // poll and the vote came from the same account, which is the one case the
+    // key's remoteJid names the chat rather than the poll's author.
+    const voter = toNonAdJid(String(
+      opts.voter || (vote && vote.participant) || (vote && vote.from) || ''));
+    if (!voter || voter.startsWith('@')) {
+      throw new Boom('decryptPollVote: cannot tell who cast this vote — pass opts.voter', { statusCode: 400 });
+    }
+    // In a group the key's remoteJid is the group; the poll's author is the
+    // participant it names.
+    const pollSender = toNonAdJid(String(
+      opts.pollSender || (key.fromMe ? voter : (key.participant || key.remoteJid || voter))));
+
+    const info = Buffer.concat([
+      Buffer.from(pollId, 'utf8'),
+      Buffer.from(pollSender, 'utf8'),
+      Buffer.from(voter, 'utf8'),
+      Buffer.from('Poll Vote', 'utf8')
+    ]);
+    const { hkdfSha256 } = require('./hkdf');
+    const voteKey = hkdfSha256(Buffer.from(secret), Buffer.alloc(0), info, 32);
+
+    const aad = Buffer.concat([
+      Buffer.from(pollId, 'utf8'), Buffer.from([0]), Buffer.from(voter, 'utf8')
+    ]);
+
+    // GCM's tag is the last 16 bytes of the payload, as it is everywhere else
+    // in this protocol.
+    const payload    = Buffer.from(d.encPayload);
+    const ciphertext = payload.subarray(0, payload.length - 16);
+    const tag        = payload.subarray(payload.length - 16);
+
+    let plaintext;
+    try {
+      const dec = crypto.createDecipheriv('aes-256-gcm', voteKey, Buffer.from(d.encIv));
+      dec.setAAD(aad);
+      dec.setAuthTag(tag);
+      plaintext = Buffer.concat([dec.update(ciphertext), dec.final()]);
+    } catch (_) {
+      throw new Boom('decryptPollVote: the ballot would not open — wrong encKey, ' +
+        'or the wrong voter/pollSender for this poll', { statusCode: 400 });
+    }
+
+    // PollVoteMessage { selectedOptions = 1, repeated bytes } — each entry is
+    // the SHA-256 of one option's text.
+    const { decodeFields } = require('./proto/MessageProto');
+    const parsed = decodeFields(plaintext);
+    const raw    = parsed[1] == null ? [] : (Array.isArray(parsed[1]) ? parsed[1] : [parsed[1]]);
+    const selectedHashes = raw.filter(Buffer.isBuffer);
+
+    let selected = [];
+    if (Array.isArray(opts.options) && opts.options.length) {
+      const byHash = new Map(opts.options.map(o => [
+        crypto.createHash('sha256').update(String(o), 'utf8').digest('hex'), String(o)
+      ]));
+      selected = selectedHashes
+        .map(h => byHash.get(h.toString('hex')))
+        .filter(o => o !== undefined);
+    }
+
+    return {
+      selected,
+      selectedHashes,
+      votedAt: d.senderTimestampMs != null ? d.senderTimestampMs : null
+    };
+  }
+
+  /**
+   * Unlink this device from the account.
+   *
+   * The companion asks the server to remove it, the same way the Linked Devices
+   * screen on the phone does, and then closes the connection. Everything on
+   * disk stays where it is — the session it describes no longer exists, so a
+   * later `connectWeb()` pairs afresh rather than trying to resume something
+   * the server has forgotten. Delete the session directory yourself if you want
+   * the keys gone as well.
+   *
+   * Web only: an account that registered its own number is not a companion and
+   * has nothing to unlink from.
+   *
+   * @returns {Promise<boolean>} whether the server accepted the removal
+   */
+  async logout() {
+    if (this._mode !== 'web') {
+      throw new Boom('logout: only a companion can unlink itself — a session ' +
+        'that registered its own number has nothing to unlink from', { statusCode: 405 });
+    }
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+
+    const ownJid = toNonAdJid(this._ownDeviceJid() || '');
+    if (!ownJid || ownJid.startsWith('@')) throw new Boom('logout: not logged in', { statusCode: 401 });
+
+    let accepted = false;
+    try {
+      const resp = await this._sendIq(new BinaryNode('iq', {
+        id:    this._genMsgId(),
+        to:    's.whatsapp.net',
+        type:  'set',
+        xmlns: 'md'
+      }, [new BinaryNode('remove-companion-device', {
+        jid:    jidStrToObj(ownJid),
+        reason: 'user_initiated'
+      }, null)]));
+      accepted = !!(resp && !(resp.attrs && resp.attrs.type === 'error'));
+    } finally {
+      // The connection goes either way. A server that refused the removal is
+      // still a server we asked to be forgotten by, and staying connected on
+      // that basis is worse than dropping.
+      this.disconnect();
+    }
+    return accepted;
+  }
+
+  // ─── Location ─────────────────────────────────────────────────────────────
+  // sendLocation(to, latitude, longitude, opts)
+  // opts: { name, address, url, id, contextInfo }
+  async sendLocation(to, latitude, longitude, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendLocation(to, latitude, longitude, opts);
+  }
+
+  // ─── Contact (vCard) ──────────────────────────────────────────────────────
+  // sendContact(to, displayName, vcard, opts)
+  // vcard is a vCard v3 string  e.g. "BEGIN:VCARD\nVERSION:3.0\nFN:Ion Popescu\nTEL:+40712345678\nEND:VCARD"
+  async sendContact(to, displayName, vcard, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendContact(to, displayName, vcard, opts);
+  }
+
+  // sendReply(to, quotedMsgId, senderJid, text, opts)
+  // Sends a text message that quotes/replies to another message.
+  // senderJid — JID of the original sender (same as `to` for DMs; member JID for groups).
+  async sendReply(to, quotedMsgId, senderJid, text, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    return this._sender.sendReply(to, quotedMsgId, senderJid, text, opts);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // BUSINESS PROFILE — queryBusinessProfile
+  // Query business profile (IQ xmlns: w:biz)
+  // Returns: { jid, description, email, website, address, category, hours... }
+  //          or null if not a business account / no data
+  // ──────────────────────────────────────────────────────────────────────────
+
+  async queryBusinessProfile(jid) {
+    const jidFull = makeJid(jid);
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:biz',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, [
+      new BinaryNode('business_profile', { v: '116' }, [
+        new BinaryNode('profile', { value: jidFull }, null)
+      ])
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return null;
+    const bpNode = findChild(resp, 'business_profile');
+    if (!bpNode) return null;
+    const pNode = findChild(bpNode, 'profile');
+    if (!pNode || !pNode.attrs) return null;
+    const a = pNode.attrs;
+    const children = Array.isArray(pNode.content) ? pNode.content : [];
+    const description = (() => {
+      const n = children.find(c => c && c.description === 'description');
+      return n ? (getNodeContent(n) || Buffer.alloc(0)).toString('utf8') : null;
+    })();
+    const email = a.email || null;
+    const website = a.website || null;
+    const address = a.address || null;
+    const category = a.business_type || a.category || null;
+    return { jid: jidFull, description, email, website, address, category };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // COMMUNITY OPERATIONS — createCommunity / deactivateCommunity /
+  //   linkGroupsToCommunity / unlinkGroupFromCommunity
+  // Protocol: IQ xmlns='w:g2' — same server as groups (g.us)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Create a community
+  // Returns parsed metadata object (same shape as getGroupMetadata) or null
+  async createCommunity(subject, description, opts) {
+    opts = opts || {};
+    const descId = crypto.randomBytes(12).toString('hex');
+    const id     = this._genMsgId();
+    const createChildren = [
+      new BinaryNode('description', { id: descId }, [
+        new BinaryNode('body', {}, Buffer.from(description || '', 'utf8'))
+      ]),
+      new BinaryNode('parent', { default_membership_approval_mode: 'request_required' }, null),
+      new BinaryNode('allow_non_admin_sub_group_creation', {}, null),
+      new BinaryNode('create_general_chat', {}, null)
+    ];
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    'g.us',
+      type:  'set'
+    }, [new BinaryNode('create', { subject }, createChildren)]);
+    const resp = await this._sendIq(node);
+    if (!resp) return null;
+    const createNode = findChild(resp, 'create');
+    const groupNode  = createNode ? findChild(createNode, 'group') : findChildDeep(resp, 'group');
+    if (!groupNode) return null;
+    return this._parseGroupNode(groupNode);
+  }
+
+  // Deactivate (delete) a community
+  async deactivateCommunity(communityJid) {
+    const jid = makeJid(communityJid);
+    const id  = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    jid,
+      type:  'set'
+    }, [new BinaryNode('delete_parent', {}, null)]);
+    return this._sendIq(node);
+  }
+
+  // Link one or more groups to a community
+  // groupJids: string or string[]
+  // Returns: array of successfully linked group JIDs
+  async linkGroupsToCommunity(communityJid, groupJids) {
+    const cJid  = makeJid(communityJid);
+    const arr   = Array.isArray(groupJids) ? groupJids : [groupJids];
+    const id    = this._genMsgId();
+    const groupNodes = arr.map(gj =>
+      new BinaryNode('group', { value: makeJid(gj) }, null)
+    );
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    cJid,
+      type:  'set'
+    }, [
+      new BinaryNode('links', {}, [
+        new BinaryNode('link', { link_type: 'sub_group' }, groupNodes)
+      ])
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return [];
+    const linksNode = findChild(resp, 'links');
+    if (!linksNode || !Array.isArray(linksNode.content)) return arr.map(makeJid);
+    const linked = [];
+    for (const linkNode of linksNode.content) {
+      if (linkNode && linkNode.description === 'link' &&
+          linkNode.attrs && linkNode.attrs.link_type === 'sub_group') {
+        const kids = Array.isArray(linkNode.content) ? linkNode.content : [];
+        for (const gn of kids) {
+          if (gn && gn.description === 'group' && gn.attrs && gn.attrs.value) {
+            linked.push(gn.attrs.value);
+          }
+        }
+      }
+    }
+    return linked.length ? linked : arr.map(makeJid);
+  }
+
+  // Unlink a group from a community
+  async unlinkGroupFromCommunity(communityJid, groupJid) {
+    const cJid = makeJid(communityJid);
+    const gJid = makeJid(groupJid);
+    const id   = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    cJid,
+      type:  'set'
+    }, [
+      new BinaryNode('unlink', { unlink_type: 'sub_group' }, [
+        new BinaryNode('group', { value: gJid }, null)
+      ])
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return false;
+    const unlinkNode = findChild(resp, 'unlink');
+    if (!unlinkNode) return false;
+    const gn = findChild(unlinkNode, 'group');
+    return !!(gn && gn.attrs && gn.attrs.value === gJid);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // NEWSLETTER (CHANNEL) OPERATIONS
+  // All newsletter IQ calls use xmlns='w:mex' (WhatsApp Meta EXchange / GraphQL)
+  // with hardcoded query_id values per operation.
+  // The JSON body follows the WhatsApp newsletter request format.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Create a newsletter / channel
+  // query_id: 6996806640408138
+  // Returns: { jid, name, description, subscriberCount } or null
+  async createNewsletter(name, description) {
+    const id   = this._genMsgId();
+    const body = JSON.stringify({
+      variables: {
+        input: {
+          name:        name || '',
+          description: description || '',
+          picture:     null
+        }
+      }
+    });
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:mex',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, [
+      new BinaryNode('query', { query_id: '6996806640408138' },
+        Buffer.from(body, 'utf8'))
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return null;
+    return this._parseNewsletterResponse(resp);
+  }
+
+  // Join / subscribe to a newsletter
+  // query_id: 9926858900719341
+  async joinNewsletter(newsletterJid) {
+    const jid  = makeJid(newsletterJid, 'newsletter');
+    const id   = this._genMsgId();
+    const body = JSON.stringify({ variables: { newsletter_id: jid } });
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:mex',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, [
+      new BinaryNode('query', { query_id: '9926858900719341' },
+        Buffer.from(body, 'utf8'))
+    ]);
+    return this._sendIq(node);
+  }
+
+  // Leave / unsubscribe from a newsletter
+  // query_id: 6392786840836363
+  async leaveNewsletter(newsletterJid) {
+    const jid  = makeJid(newsletterJid, 'newsletter');
+    const id   = this._genMsgId();
+    const body = JSON.stringify({ variables: { newsletter_id: jid } });
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:mex',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, [
+      new BinaryNode('query', { query_id: '6392786840836363' },
+        Buffer.from(body, 'utf8'))
+    ]);
+    return this._sendIq(node);
+  }
+
+  // Query newsletter metadata
+  // query_id: 6111171595650958
+  // Returns: { jid, name, description, subscriberCount } or null
+  async queryNewsletterMetadata(newsletterJid) {
+    const jid  = makeJid(newsletterJid, 'newsletter');
+    const id   = this._genMsgId();
+    const body = JSON.stringify({ variables: { newsletter_id: jid } });
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:mex',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, [
+      new BinaryNode('query', { query_id: '6111171595650958' },
+        Buffer.from(body, 'utf8'))
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return null;
+    return this._parseNewsletterResponse(resp);
+  }
+
+  // Change newsletter description
+  // query_id: 7150902998257522
+  async changeNewsletterDescription(newsletterJid, description) {
+    const jid  = makeJid(newsletterJid, 'newsletter');
+    const id   = this._genMsgId();
+    const body = JSON.stringify({
+      variables: { newsletter_id: jid, updates: { description: description || '' } }
+    });
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:mex',
+      to:    's.whatsapp.net',
+      type:  'get'
+    }, [
+      new BinaryNode('query', { query_id: '7150902998257522' },
+        Buffer.from(body, 'utf8'))
+    ]);
+    return this._sendIq(node);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // ACCOUNT RESTRICTION (reachout timelock)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Ask the server whether this account is currently restricted, and until when.
+   *
+   * A restriction is what error 463 means when it will not go away: WhatsApp
+   * has decided the account is starting too many chats with people who never
+   * reply, and refuses new ones until it expires. Existing chats keep working,
+   * which is why the account otherwise looks fine.
+   *
+   * The expiry is not pushed to the client — this is the only way to learn it.
+   *
+   * @returns {Promise<object>} { active, remaining, remainingMs, endsAtDate,
+   *                              enforcementType, reason, expiryUnknown }
+   */
+  async fetchReachoutTimelock() {
+    const payload = await this._mexQuery(MEX_QUERY_REACHOUT_TIMELOCK, {},
+      'xwa2_fetch_account_reachout_timelock');
+
+    // Some servers answer this one tersely: a bare boolean rather than the
+    // object with the expiry in it. `false` is a definite "no restriction" and
+    // is taken at face value; `true` says there is one but not when it ends, so
+    // it is marked as an expiry we do not know and the announcement supplies
+    // the countdown.
+    if (typeof payload === 'boolean') {
+      return this._setReachoutTimelock(
+        ReachoutTimelock.parseTimelockPayload({ is_active: payload }), 'query');
+    }
+
+    if (payload == null || typeof payload !== 'object') {
+      const err = new Boom('the server answered ' + JSON.stringify(payload) +
+        ', which says nothing about a restriction either way', { statusCode: 502 });
+      err.mexDecoded = payload;
+      throw err;
+    }
+
+    return this._setReachoutTimelock(
+      ReachoutTimelock.parseTimelockPayload(payload), 'query');
+  }
+
+  /**
+   * What we last learned about the restriction, without asking again.
+   *
+   * The countdown is computed fresh on every call, so this is what a ticking
+   * display reads once a second. Returns an inactive state when nothing has
+   * been fetched yet — call fetchReachoutTimelock() for that.
+   */
+  getReachoutTimelock() {
+    return ReachoutTimelock.describe(this._reachoutTimelock);
+  }
+
+  /**
+   * Refresh the restriction after a send was refused, at most once a minute.
+   *
+   * A 463 has two causes that look identical on the wire: a contact we simply
+   * hold no privacy token for, which the resend recovers from, and an account
+   * restriction, which no resend will fix. Asking the server tells the two
+   * apart, and it is the only way to learn when the restriction ends.
+   *
+   * Rate-limited because a burst of refused sends would otherwise fire one
+   * query each, and a restricted account is exactly where a burst happens.
+   */
+  _refreshReachoutTimelockAfter463() {
+    if (!this._connected) return;
+    const last = this._reachoutTimelock && this._reachoutTimelock.checkedAt;
+    if (last && Date.now() - last < 60000) return;
+    if (this._reachoutTimelockInFlight) return;
+
+    this._reachoutTimelockInFlight = this.fetchReachoutTimelock()
+      .then(state => {
+        if (state.active) {
+          _whaDbg('[DBG] ACCOUNT_RESTRICTED for ' + state.remaining +
+            ' (' + state.enforcementType + ')');
+        }
+      })
+      .catch(err => _whaDbg('[DBG] REACHOUT_TIMELOCK fetch failed: ' + (err && err.message)))
+      .then(() => { this._reachoutTimelockInFlight = null; });
+  }
+
+  _setReachoutTimelock(state, source) {
+    this._reachoutTimelock = Object.assign({}, state, { checkedAt: Date.now() });
+    const described = ReachoutTimelock.describe(this._reachoutTimelock);
+    this.emit('account_restriction', Object.assign({ source }, described));
+    return described;
+  }
+
+  /**
+   * One w:mex GraphQL call.
+   *
+   * The reply is JSON inside <result>. GraphQL reports failures in the body
+   * with a 200-shaped envelope, so an errors array has to be checked for
+   * separately — otherwise a refused query reads as an empty result and the
+   * caller concludes the account is fine.
+   */
+  async _mexQuery(queryId, variables, dataPath) {
+    const body = Buffer.from(JSON.stringify({ variables: variables || {} }), 'utf8');
+
+    // The <query> node carries the query id and nothing else.
+    //
+    // Asking for a format here was tried and is wrong: a `format="json"`
+    // attribute makes the server drop the stanza on the floor — no reply at
+    // all, where without it there is at least an answer. It does not ignore
+    // what it does not recognise, so nothing speculative belongs on this node.
+    const resp = await this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'get',
+      xmlns: 'w:mex'
+    }, [new BinaryNode('query', { query_id: String(queryId) }, body)]));
+
+    if (!resp) throw new Boom('mex query ' + queryId + ': no reply from server (IQ timed out)', { statusCode: 408 });
+
+    // An <error> child is the refusal whether or not the iq is typed as one.
+    const errNode = (resp.attrs && resp.attrs.type === 'error')
+      ? findChildDeep(resp, 'error') : findChild(resp, 'error');
+    if (errNode) {
+      const a    = errNode.attrs || {};
+      const code = a.code ? String(a.code) : null;
+      const text = a.text ? String(a.text) : null;
+      throw new Boom('mex query ' + queryId + ': server rejected the request' +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+    }
+
+    // The JSON normally sits in <result>, but not every build wraps it the same
+    // way, so take it from wherever in the reply it turns up rather than from
+    // one fixed path.
+    const json = this._mexJsonFrom(resp);
+    if (json) {
+      if (json.errors && json.errors.length) {
+        throw new Boom('mex query ' + queryId + ': ' +
+          json.errors.map(e => (e && e.message) || 'unknown error').join(', '), { statusCode: 502 });
+      }
+      return dataPath ? (json.data && json.data[dataPath]) : json.data;
+    }
+
+    // Not JSON, so the other encoding this transport uses: Argo, which is what
+    // newer servers answer with. It carries its own field names, so it decodes
+    // without the GraphQL schema the query was written against.
+    const resultNode = findChildDeep(resp, 'result');
+    const format     = resultNode && resultNode.attrs && resultNode.attrs.format;
+    const raw        = resultNode ? getNodeContent(resultNode) : null;
+
+    // Only when the server said so. Guessing that unlabelled bytes are Argo
+    // turns "this reply is not what I expected" into a misleading complaint
+    // about a format that was never claimed.
+    if (raw && raw.length && format && String(format).toLowerCase() === 'argo') {
+      let decoded;
+      try {
+        decoded = decodeArgo(raw);
+      } catch (e) {
+        const err = new Boom('mex query ' + queryId + ': the reply is ' +
+          (format ? '"' + format + '"' : 'binary') + ' and could not be decoded — ' +
+          e.message + ' (' + raw.length + ' bytes: ' + raw.toString('hex') + ')', { statusCode: 502 });
+        err.mexFormat  = format ? String(format) : null;
+        err.mexPayload = raw;
+        throw err;
+      }
+      _whaDbg('[DBG] MEX_ARGO decoded ' + JSON.stringify(decoded));
+
+      if (decoded && typeof decoded === 'object') {
+        if (decoded.errors && decoded.errors.length) {
+          throw new Boom('mex query ' + queryId + ': ' +
+            decoded.errors.map(e => (e && e.message) || 'unknown error').join(', '), { statusCode: 502 });
+        }
+        if (decoded.data !== undefined) {
+          return dataPath ? (decoded.data && decoded.data[dataPath]) : decoded.data;
+        }
+        return dataPath ? decoded[dataPath] : decoded;
+      }
+
+      // Not a GraphQL envelope but still an answer — a bare boolean, most
+      // often. Handed back as-is for the caller to interpret, since only the
+      // caller knows what its own query means.
+      return decoded;
+    }
+
+    if (format && String(format).toLowerCase() !== 'json') {
+      const err = new Boom('mex query ' + queryId + ': the server answered in "' +
+        format + '", which this library cannot read' +
+        (raw ? ' (' + raw.length + ' bytes: ' + raw.toString('hex') + ')' : ''), { statusCode: 502 });
+      err.mexFormat  = String(format);
+      err.mexPayload = raw || null;
+      _whaDbg('[DBG] MEX_REPLY_FORMAT ' + format + ' — cannot decode');
+      throw err;
+    }
+
+    _whaDbg('[DBG] MEX_REPLY_UNPARSED ' + JSON.stringify(describeNodeBriefly(resp)));
+    throw new Boom('mex query ' + queryId + ': the reply carried no JSON — ' +
+      describeNodeBriefly(resp), { statusCode: 502 });
+  }
+
+  // Walk the reply for the first node whose content parses as a JSON object.
+  //
+  // Content arrives as bytes for a long payload and as a plain string when the
+  // encoder had a token for it, so both are tried.
+  _mexJsonFrom(node) {
+    if (!node) return null;
+    const raw = getNodeContent(node);
+    if (raw && raw.length) {
+      const text = raw.toString('utf8').trim();
+      if (text.startsWith('{') || text.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed && typeof parsed === 'object') return parsed;
+        } catch (_) { /* not this node */ }
+      }
+    }
+    if (Array.isArray(node.content)) {
+      for (const child of node.content) {
+        const found = this._mexJsonFrom(child);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * <notification type="mex"> — a GraphQL push rather than a reply.
+   *
+   * The restriction is the one that matters here: the server announces both
+   * when it starts and when it is lifted, so a client that listens does not
+   * have to poll to know it can send again.
+   */
+  _handleMexNotification(node) {
+    const update = findChild(node, 'update');
+    if (!update) return;
+    const opName = (update.attrs && update.attrs.op_name) || '';
+    const buf    = getNodeContent(update);
+    if (!buf) return;
+
+    let json;
+    try { json = JSON.parse(buf.toString('utf8')); }
+    catch (_) { _whaDbg('[DBG] MEX_NOTIF ' + opName + ' — body was not JSON'); return; }
+    if (json.errors && json.errors.length) return;
+    const data = json.data;
+    if (!data) return;
+
+    if (opName === 'NotificationUserReachoutTimelockUpdate') {
+      const payload = data.xwa2_notify_account_reachout_timelock;
+      if (!payload) return;
+      const state = ReachoutTimelock.parseTimelockPayload(payload);
+      _whaDbg('[DBG] MEX_NOTIF restriction ' + (state.active ? 'set' : 'lifted'));
+      this._setReachoutTimelock(state, 'notification');
+      return;
+    }
+
+    // Anything else the server pushes this way, passed on rather than dropped.
+    this.emit('mex_notification', { opName, data });
+  }
+
+  // Internal: parse newsletter response from w:mex IQ result
+  //
+  // Every newsletter call travels the same transport as the restriction query,
+  // so a server that answers that one in Argo answers these in Argo too. This
+  // used to swallow that and return null, which reads as "no such newsletter"
+  // rather than "this reply is in an encoding nothing here can read" — the
+  // difference between a shrug and something a caller can act on.
+  _parseNewsletterResponse(resp) {
+    try {
+      const json = this._mexJsonFrom(resp);
+      if (!json) {
+        const resultNode = findChildDeep(resp, 'result');
+        const format     = resultNode && resultNode.attrs && resultNode.attrs.format;
+        if (format && String(format).toLowerCase() !== 'json') {
+          _whaDbg('[DBG] NEWSLETTER reply format=' + format + ' — cannot decode');
+          const err = new Boom('the server answered in "' + format +
+            '" rather than JSON, which this library cannot read', { statusCode: 502 });
+          err.mexFormat = String(format);
+          throw err;
+        }
+        return null;
+      }
+      const nl = json && (json.newsletter || (json.data && json.data.xwa2_newsletter));
+      if (!nl) return null;
+      const meta = nl.metadata || nl;
+      return {
+        jid:             nl.id || meta.jid || null,
+        name:            meta.name || nl.name || null,
+        description:     meta.description || nl.description || null,
+        subscriberCount: nl.subscribers_count || meta.subscriber_count || 0,
+        creationTime:    nl.creation_time || meta.creation_time || 0
+      };
+    } catch (err) {
+      if (err && err.mexFormat) throw err;
+      return null;
+    }
+  }
+
+  // Send a text message to a newsletter you own
+  // Newsletter messages are NOT end-to-end encrypted — they are public channel posts.
+  // The stanza differs from regular messages: no <participants> or <enc>, uses
+  // <plaintext-body> and carries server_id + edit attributes.
+  async sendNewsletterText(newsletterJid, text) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    const jid    = makeJid(newsletterJid, 'newsletter');
+    // A channel post is an encoded Message in <plaintext>, the same shape the
+    // posts we receive have. This used to send the bare text in a node of
+    // another name, with a server id the client does not get to choose.
+    const { encodeText } = require('./proto/MessageProto');
+    return this.sendNewsletterMessage(jid, encodeText(String(text == null ? '' : text)), { type: 'text' });
+  }
+
+
+  // ─── Newsletters: reading, reacting, following along ──────────────────────
+
+  // <message server_id id type t> children of a newsletter reply or push.
+  _parseNewsletterMessages(parent) {
+    const { decodeMessageContainer } = require('./proto/MessageProto');
+    const out = [];
+    const children = parent && Array.isArray(parent.content) ? parent.content : [];
+    for (const child of children) {
+      if (!child || child.description !== 'message') continue;
+      const a = child.attrs || {};
+      const msg = {
+        serverId: a.server_id != null ? Number(a.server_id) : null,
+        id:       a.id != null ? String(a.id) : null,
+        type:     a.type != null ? String(a.type) : null,
+        ts:       a.t != null ? parseInt(a.t, 10) || 0 : 0,
+        viewsCount: 0, forwardsCount: 0, reactionCounts: null,
+        raw: null, decoded: null
+      };
+      for (const sub of (Array.isArray(child.content) ? child.content : [])) {
+        if (!sub) continue;
+        const sa = sub.attrs || {};
+        if (sub.description === 'plaintext') {
+          const buf = getNodeContent(sub);
+          if (buf && buf.length) {
+            msg.raw = buf;
+            try { msg.decoded = decodeMessageContainer(buf); } catch (_) { msg.decoded = null; }
+          }
+        } else if (sub.description === 'views_count') {
+          msg.viewsCount = Number(sa.count) || 0;
+        } else if (sub.description === 'forwards_count') {
+          msg.forwardsCount = Number(sa.count) || 0;
+        } else if (sub.description === 'reactions') {
+          msg.reactionCounts = {};
+          for (const r of (Array.isArray(sub.content) ? sub.content : [])) {
+            if (r && r.attrs && r.attrs.code != null) {
+              msg.reactionCounts[String(r.attrs.code)] = Number(r.attrs.count) || 0;
+            }
+          }
+        }
+      }
+      out.push(msg);
+    }
+    return out;
+  }
+
+  // Throws on no answer and on an <iq type="error">, naming the step.
+  async _iqOrThrow(node, what) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom(what + ': no reply from the server', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const e = findChild(resp, 'error');
+      const code = e && e.attrs && e.attrs.code != null ? String(e.attrs.code) : null;
+      const text = e && e.attrs && e.attrs.text ? String(e.attrs.text) : null;
+      const err = new Boom(what + ': refused by the server' +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+      err.code = code; err.text = text;
+      throw err;
+    }
+    return resp;
+  }
+
+  /**
+   * The newest posts of a channel, oldest first within the page.
+   * @param {object} [opts] `{ count, before }` — `before` is a server id to page back from
+   */
+  async getNewsletterMessages(newsletterJid, opts) {
+    opts = opts || {};
+    const jid = makeJid(newsletterJid, 'newsletter');
+    const attrs = { type: 'jid', jid };
+    if (opts.count)  attrs.count  = String(opts.count);
+    if (opts.before) attrs.before = String(opts.before);
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: 's.whatsapp.net', type: 'get', xmlns: 'newsletter'
+    }, [new BinaryNode('messages', attrs, null)]), 'newsletter messages');
+    const messages = findChild(resp, 'messages');
+    if (!messages) throw new Boom('newsletter messages: the reply carried no messages', { statusCode: 502 });
+    return this._parseNewsletterMessages(messages);
+  }
+
+  /**
+   * What changed on a channel's posts — view and reaction counts, edits.
+   * @param {object} [opts] `{ count, since, after }` — `since` is unix seconds,
+   *                        `after` a server id
+   */
+  async getNewsletterMessageUpdates(newsletterJid, opts) {
+    opts = opts || {};
+    const jid = makeJid(newsletterJid, 'newsletter');
+    const attrs = {};
+    if (opts.count) attrs.count = String(opts.count);
+    if (opts.since) attrs.since = String(Math.floor(Number(opts.since)));
+    if (opts.after) attrs.after = String(opts.after);
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: jid, type: 'get', xmlns: 'newsletter'
+    }, [new BinaryNode('message_updates', attrs, null)]), 'newsletter message updates');
+    const messages = findChild(findChild(resp, 'message_updates'), 'messages');
+    if (!messages) throw new Boom('newsletter message updates: the reply carried no messages', { statusCode: 502 });
+    return this._parseNewsletterMessages(messages);
+  }
+
+  /**
+   * Ask for a channel's updates to be pushed as they happen. The subscription
+   * lasts as long as the server says — the returned number of seconds — and has
+   * to be asked for again after that. Updates arrive as `newsletter_live_update`.
+   */
+  async subscribeNewsletterLiveUpdates(newsletterJid) {
+    const jid = makeJid(newsletterJid, 'newsletter');
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: jid, type: 'set', xmlns: 'newsletter'
+    }, [new BinaryNode('live_updates', {}, null)]), 'newsletter live updates');
+    const live = findChild(resp, 'live_updates');
+    return { durationSecs: live && live.attrs ? Number(live.attrs.duration) || 0 : 0 };
+  }
+
+  /** Count posts as viewed. `serverIds` are the posts' server ids. */
+  async markNewsletterViewed(newsletterJid, serverIds) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    const jid = makeJid(newsletterJid, 'newsletter');
+    const ids = (Array.isArray(serverIds) ? serverIds : [serverIds]).filter(v => v != null);
+    if (!ids.length) throw new Boom('markNewsletterViewed: at least one server id is required', { statusCode: 400 });
+    this._socket.sendNode(new BinaryNode('receipt', {
+      to: jid, type: 'view', id: this._genMsgId()
+    }, [new BinaryNode('list', {}, ids.map(id => new BinaryNode('item', { server_id: String(id) }, null)))]));
+  }
+
+  /** React to a channel post. An empty `reaction` takes ours back. */
+  async sendNewsletterReaction(newsletterJid, serverId, reaction, opts) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (serverId == null) throw new Boom('sendNewsletterReaction: the post\'s server id is required', { statusCode: 400 });
+    const jid = makeJid(newsletterJid, 'newsletter');
+    const id  = (opts && opts.id) || this._genMsgId();
+    const attrs = { to: jid, id, server_id: String(serverId), type: 'reaction' };
+    const reactionAttrs = {};
+    if (reaction) reactionAttrs.code = String(reaction); else attrs.edit = '7';
+    this._socket.sendNode(new BinaryNode('message', attrs, [new BinaryNode('reaction', reactionAttrs, null)]));
+    return { id, to: jid };
+  }
+
+  /** Mute or unmute a channel we follow. */
+  async muteNewsletter(newsletterJid, mute) {
+    const jid = makeJid(newsletterJid, 'newsletter');
+    await this._mexQuery(mute === false ? '6068417879924485' : '6274038279359549', { newsletter_id: jid });
+    return { jid, muted: mute !== false };
+  }
+
+  async unmuteNewsletter(newsletterJid) { return this.muteNewsletter(newsletterJid, false); }
+
+  /** The channels this account follows, as the server describes them. */
+  async getSubscribedNewsletters() {
+    const list = await this._mexQuery('6388546374527196', {}, 'xwa2_newsletter_subscribed');
+    return Array.isArray(list) ? list : [];
+  }
+
+  /** A channel's metadata from its invite link or the code at the end of it. */
+  async getNewsletterInfoWithInvite(linkOrCode) {
+    const key = String(linkOrCode || '').replace(/^https?:\/\/(www\.)?whatsapp\.com\/channel\//i, '').trim();
+    if (!key) throw new Boom('getNewsletterInfoWithInvite: an invite link or code is required', { statusCode: 400 });
+    return this._mexQuery('6563316087068696', {
+      fetch_creation_time: true, fetch_full_image: true, fetch_viewer_metadata: false,
+      input: { key, type: 'INVITE' }
+    }, 'xwa2_newsletter');
+  }
+
+  /**
+   * Post a Message you encoded to a channel you administer.
+   * @param {object} [opts] `{ id, type, mediaType, mediaId, edit }`
+   */
+  async sendNewsletterMessage(newsletterJid, message, opts) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    if (!Buffer.isBuffer(message) || !message.length) {
+      throw new Boom('sendNewsletterMessage: message must be a non-empty Buffer holding an encoded Message', { statusCode: 400 });
+    }
+    opts = opts || {};
+    const jid = makeJid(newsletterJid, 'newsletter');
+    const id  = opts.id || this._genMsgId();
+    const attrs = { to: jid, id, type: opts.type || 'text' };
+    if (opts.mediaId) attrs.media_id = String(opts.mediaId);
+    if (opts.edit)    attrs.edit = String(opts.edit);
+    const ptAttrs = {};
+    if (opts.mediaType) ptAttrs.mediatype = String(opts.mediaType);
+    this._socket.sendNode(new BinaryNode('message', attrs, [new BinaryNode('plaintext', ptAttrs, message)]));
+    return { id, to: jid };
+  }
+
+  // <notification type="newsletter"><live_updates><messages>…
+  _handleNewsletterNotification(node) {
+    const live = findChild(node, 'live_updates');
+    if (!live) return;
+    const holder = findChild(live, 'messages') || live;
+    const a = node.attrs || {};
+    this.emit('newsletter_live_update', {
+      jid: String(a.from || ''), ts: a.t != null ? parseInt(a.t, 10) || 0 : 0,
+      messages: this._parseNewsletterMessages(holder)
+    });
+  }
+
+  // <notification type="picture"><set|add|delete jid author id/>
+  _handlePictureNotification(node) {
+    const ts = node.attrs && node.attrs.t != null ? parseInt(node.attrs.t, 10) || 0 : 0;
+    for (const child of (Array.isArray(node.content) ? node.content : [])) {
+      if (!child) continue;
+      const tag = child.description;
+      if (tag !== 'set' && tag !== 'add' && tag !== 'delete') continue;
+      const a = child.attrs || {};
+      const jid = a.jid != null ? String(a.jid) : String((node.attrs && node.attrs.from) || '');
+      if (!jid) continue;
+      this.emit('picture_update', {
+        jid, author: a.author != null ? String(a.author) : null,
+        removed: tag === 'delete', pictureId: tag === 'delete' ? null : (a.id != null ? String(a.id) : null), ts
+      });
+    }
+  }
+
+  // <notification type="status" from t><set>text</set>
+  _handleAboutNotification(node) {
+    const set = findChild(node, 'set');
+    const buf = set ? getNodeContent(set) : null;
+    if (!set || buf == null) return;
+    const a = node.attrs || {};
+    this.emit('about_update', {
+      jid: String(a.from || ''), about: buf.toString('utf8'),
+      ts: a.t != null ? parseInt(a.t, 10) || 0 : 0
+    });
+  }
+
+  // ─── Communities, links, bots, labels ─────────────────────────────────────
+
+  /** The groups linked to a community. */
+  async getSubGroups(communityJid) {
+    const jid = makeJid(communityJid, 'g.us');
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: jid, type: 'get', xmlns: 'w:g2'
+    }, [new BinaryNode('sub_groups', {}, null)]), 'sub groups');
+    const holder = findChild(resp, 'sub_groups');
+    if (!holder) throw new Boom('sub groups: the reply carried no sub_groups', { statusCode: 502 });
+    return (Array.isArray(holder.content) ? holder.content : [])
+      .filter(c => c && c.description === 'group' && c.attrs && c.attrs.id)
+      .map(c => {
+        const a = c.attrs;
+        const id = String(a.id);
+        return {
+          jid: id.includes('@') ? id : id + '@g.us',
+          subject: a.subject != null ? String(a.subject) : null,
+          subjectTime: a.s_t != null ? parseInt(a.s_t, 10) || 0 : 0,
+          size: a.size != null ? Number(a.size) || 0 : null,
+          isDefaultSubGroup: !!findChild(c, 'default_sub_group')
+        };
+      });
+  }
+
+  /** Everyone in any group of a community. Only its admins may ask. */
+  async getLinkedGroupsParticipants(communityJid) {
+    const jid = makeJid(communityJid, 'g.us');
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: jid, type: 'get', xmlns: 'w:g2'
+    }, [new BinaryNode('linked_groups_participants', {}, null)]), 'linked groups participants');
+    const holder = findChild(resp, 'linked_groups_participants');
+    if (!holder) throw new Boom('linked groups participants: the reply carried none', { statusCode: 502 });
+    return (Array.isArray(holder.content) ? holder.content : [])
+      .filter(c => c && c.description === 'participant' && c.attrs && c.attrs.jid)
+      .map(c => {
+        const a = c.attrs;
+        const pJid = String(a.jid), pn = a.phone_number ? String(a.phone_number) : null;
+        const lid = a.lid ? String(a.lid) : null;
+        const lidUser = (pJid.endsWith('@lid') ? pJid : lid || '').split('@')[0].split(':')[0];
+        const pnUser  = (pJid.endsWith('@lid') ? pn || '' : pJid).split('@')[0].split(':')[0];
+        if (lidUser && pnUser && this._lidToPn && this._pnToLid) {
+          this._lidToPn.set(lidUser, pnUser); this._pnToLid.set(pnUser, lidUser);
+        }
+        return { jid: pJid, phoneNumber: pn, lid };
+      });
+  }
+
+  /** Where a wa.me/message/… business link points, and the text it prefills. */
+  async resolveBusinessMessageLink(linkOrCode) {
+    const code = String(linkOrCode || '')
+      .replace(/^https?:\/\/(wa\.me\/message\/|api\.whatsapp\.com\/message\/)/i, '').split(/[?#]/)[0].trim();
+    if (!code) throw new Boom('resolveBusinessMessageLink: a link or code is required', { statusCode: 400 });
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: 's.whatsapp.net', type: 'get', xmlns: 'w:qr'
+    }, [new BinaryNode('qr', { code }, null)]), 'business message link');
+    const qr = findChild(resp, 'qr');
+    if (!qr) throw new Boom('business message link: the reply carried no qr', { statusCode: 502 });
+    const a = qr.attrs || {};
+    const msg = findChild(qr, 'message'), biz = findChild(qr, 'business');
+    const b = (biz && biz.attrs) || {};
+    const msgBuf = msg ? getNodeContent(msg) : null;
+    return {
+      jid: a.jid != null ? String(a.jid) : null,
+      pushName: a.notify != null ? String(a.notify) : null,
+      message: msgBuf ? msgBuf.toString('utf8') : null,
+      isSigned: String(b.is_signed) === 'true',
+      verifiedName: b.verified_name != null ? String(b.verified_name) : null,
+      verifiedLevel: b.verified_level != null ? String(b.verified_level) : null
+    };
+  }
+
+  /** Our own contact link, as wa.me/qr/…; `revoke` replaces it with a new one. */
+  async getContactQrLink(revoke) {
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: 's.whatsapp.net', type: 'set', xmlns: 'w:qr'
+    }, [new BinaryNode('qr', { type: 'contact', action: revoke ? 'revoke' : 'get' }, null)]), 'contact link');
+    const qr = findChild(resp, 'qr');
+    const code = qr && qr.attrs && qr.attrs.code != null ? String(qr.attrs.code) : null;
+    if (!code) throw new Boom('contact link: the reply carried no code', { statusCode: 502 });
+    return { code, link: 'https://wa.me/qr/' + code };
+  }
+
+  /** Whose contact a wa.me/qr/… link is. */
+  async resolveContactQrLink(linkOrCode) {
+    const code = String(linkOrCode || '')
+      .replace(/^https?:\/\/(wa\.me\/qr\/|api\.whatsapp\.com\/qr\/)/i, '').split(/[?#]/)[0].trim();
+    if (!code) throw new Boom('resolveContactQrLink: a link or code is required', { statusCode: 400 });
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: 's.whatsapp.net', type: 'get', xmlns: 'w:qr'
+    }, [new BinaryNode('qr', { code }, null)]), 'contact link');
+    const qr = findChild(resp, 'qr');
+    if (!qr) throw new Boom('contact link: the reply carried no qr', { statusCode: 502 });
+    const a = qr.attrs || {};
+    return {
+      jid: a.jid != null ? String(a.jid) : null,
+      pushName: a.notify != null ? String(a.notify) : null,
+      type: a.type != null ? String(a.type) : null
+    };
+  }
+
+  /** The Meta AI bots the server lists: `[{ jid, personaId }]`. */
+  async getBotList() {
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: 's.whatsapp.net', type: 'get', xmlns: 'bot'
+    }, [new BinaryNode('bot', { v: '2' }, null)]), 'bot list');
+    const botNode = findChild(resp, 'bot');
+    if (!botNode) throw new Boom('bot list: the reply carried no bot node', { statusCode: 502 });
+    const out = [];
+    for (const section of (Array.isArray(botNode.content) ? botNode.content : [])) {
+      if (!section || section.description !== 'section' || !section.attrs || section.attrs.type !== 'all') continue;
+      for (const bot of (Array.isArray(section.content) ? section.content : [])) {
+        if (!bot || bot.description !== 'bot' || !bot.attrs || bot.attrs.jid == null) continue;
+        out.push({ jid: String(bot.attrs.jid), personaId: bot.attrs.persona_id != null ? String(bot.attrs.persona_id) : null });
+      }
+    }
+    return out;
+  }
+
+  /** Create, rename or recolour a label, or delete it with `{ deleted: true }`. */
+  async editLabel(labelId, opts) {
+    opts = opts || {};
+    if (labelId == null || labelId === '') throw new Boom('editLabel: a label id is required', { statusCode: 400 });
+    await this._sendAppStatePatch(AppMutations.labelEditPatch(labelId, opts.name, opts.color, opts.deleted));
+    this.emit('label_edit', { labelId: String(labelId), name: opts.name || '', color: opts.color || 0, deleted: !!opts.deleted, synced: true });
+  }
+
+  /** Put a label on a chat, or take it off with `labeled: false`. */
+  async labelChat(jid, labelId, labeled) {
+    const jidFull = makeJid(jid);
+    await this._sendAppStatePatch(AppMutations.labelChatPatch(jidFull, labelId, labeled !== false));
+    this.emit('label_association', { labelId: String(labelId), jid: jidFull, msgId: null, labeled: labeled !== false, synced: true });
+  }
+
+  /** Put a label on one message, or take it off with `labeled: false`. */
+  async labelMessage(jid, labelId, msgId, labeled) {
+    const jidFull = makeJid(jid);
+    if (!msgId) throw new Boom('labelMessage: a message id is required', { statusCode: 400 });
+    await this._sendAppStatePatch(AppMutations.labelMessagePatch(jidFull, labelId, msgId, labeled !== false));
+    this.emit('label_association', { labelId: String(labelId), jid: jidFull, msgId, labeled: labeled !== false, synced: true });
+  }
+
+  /**
+   * Delete one message on this account's devices only.
+   * @param {object} [opts] `{ timestamp, deleteMedia }` — the message's time in
+   *                        unix seconds, and whether its media goes too
+   */
+  async deleteMessageForMe(jid, msgId, fromMe, opts) {
+    opts = opts || {};
+    const jidFull = makeJid(jid);
+    if (!msgId) throw new Boom('deleteMessageForMe: a message id is required', { statusCode: 400 });
+    await this._sendAppStatePatch(AppMutations.deleteMessageForMePatch(
+      jidFull, msgId, !!fromMe, opts.timestamp, opts.deleteMedia));
+    this.emit('message_deleted_for_me', { jid: jidFull, msgId, fromMe: !!fromMe, deleteMedia: !!opts.deleteMedia, synced: true });
+  }
+
+  /**
+   * A sticker pack's listing from WhatsApp's static store: its name, publisher
+   * and stickers. `packId` is the id in a sticker pack link.
+   */
+  async fetchStickerPack(packId) {
+    const id = String(packId || '').trim();
+    if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Boom('fetchStickerPack: a sticker pack id is required', { statusCode: 400 });
+    const url = 'https://static.whatsapp.net/sticker?lottie=1&cat=sticker_pack_data&id=' +
+      encodeURIComponent(id) + '&lg=en';
+    const body = await new Promise((resolve, reject) => {
+      const req = require('https').get(url, { headers: { Origin: 'https://web.whatsapp.com' } }, (res) => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          res.resume();
+          return reject(new Boom('fetchStickerPack: the store answered ' + res.statusCode, { statusCode: statusFrom(res.statusCode) }));
+        }
+        const chunks = []; let size = 0;
+        res.on('data', (c) => {
+          size += c.length;
+          if (size > 4 * 1024 * 1024) { req.destroy(new Boom('fetchStickerPack: the listing is too large', { statusCode: 413 })); return; }
+          chunks.push(c);
+        });
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        res.on('error', reject);
+      });
+      req.setTimeout(30000, () => req.destroy(new Boom('fetchStickerPack: timed out', { statusCode: 408 })));
+      req.on('error', reject);
+    });
+    let packs;
+    try { packs = JSON.parse(body); } catch (_) { throw new Boom('fetchStickerPack: the store did not answer with JSON', { statusCode: 502 }); }
+    if (!Array.isArray(packs) || !packs.length) throw new Boom('fetchStickerPack: no sticker pack found', { statusCode: 404 });
+    return packs[0];
+  }
+
+  /**
+   * Register a Web Push subscription, so the server wakes this client through
+   * the browser's push service. `auth` and `p256dh` are the subscription's keys.
+   */
+  async registerWebPush(subscription) {
+    const sub = subscription || {};
+    if (!sub.endpoint || !sub.auth || !sub.p256dh) {
+      throw new Boom('registerWebPush: endpoint, auth and p256dh are required', { statusCode: 400 });
+    }
+    const b64 = (v) => (Buffer.isBuffer(v) ? v : Buffer.from(String(v).replace(/-/g, '+').replace(/_/g, '/'), 'base64')).toString('base64');
+    await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: 's.whatsapp.net', type: 'set', xmlns: 'urn:xmpp:whatsapp:push'
+    }, [new BinaryNode('config', {
+      platform: 'web', endpoint: String(sub.endpoint), auth: b64(sub.auth), p256dh: b64(sub.p256dh)
+    }, null)]), 'web push registration');
+  }
+
+  /** The push settings the server holds for this device, as attributes. */
+  async getPushConfig() {
+    const resp = await this._iqOrThrow(new BinaryNode('iq', {
+      id: this._genMsgId(), to: 's.whatsapp.net', type: 'get', xmlns: 'urn:xmpp:whatsapp:push'
+    }, [new BinaryNode('settings', {}, null)]), 'push settings');
+    const settings = findChild(resp, 'settings');
+    return Object.assign({}, (settings && settings.attrs) || {});
+  }
+
+  /**
+   * Tell our own phone that a history sync blob could not be fetched, so it
+   * uploads it again. `mediaKey` is the one the history notification carried.
+   */
+  async sendHistorySyncServerErrorReceipt(msgId, mediaKey) {
+    if (!this._socket || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    const { encryptRetryReceipt } = require('./messages/MediaRetry');
+    const { ciphertext, iv } = encryptRetryReceipt(String(msgId), mediaKey);
+    this._socket.sendNode(new BinaryNode('receipt', {
+      id: String(msgId), type: 'server-error', to: toNonAdJid(this._ownDeviceJid()), category: 'peer'
+    }, [new BinaryNode('encrypt', {}, [
+      new BinaryNode('enc_p', {}, ciphertext), new BinaryNode('enc_iv', {}, iv)
+    ])]));
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // CHAT STATE — markChatRead, markChatUnread, muteChat, unmuteChat,
+  //              pinChat, unpinChat, archiveChat, unarchiveChat,
+  //              starMessage, unstarMessage, markMessagePlayed,
+  //              blockContact, unblockContact, changeEphemeralTimer
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Clears the unread badge on a chat. This is the chat's own read flag — to
+  // send read receipts for particular messages, use markRead().
+  async markChatRead(jid) {
+    const jidFull = makeJid(jid);
+    const synced  = await this._appStatePatchOrFallback(
+      AppMutations.markReadPatch(jidFull, true),
+      () => this._sendIq(new BinaryNode('iq', {
+        id: this._genMsgId(), to: 's.whatsapp.net', type: 'set', xmlns: 'w'
+      }, [new BinaryNode('read',
+        { jid: jidFull, count: '-1', index: '0', owner: 'false' }, null)])));
+    this._getChatState(jidFull).markedAsUnread = false;
+    this.emit('chat_read', { jid: jidFull, read: true, synced });
+    return synced;
+  }
+
+  async markChatUnread(jid) {
+    const jidFull = makeJid(jid);
+    const synced  = await this._appStatePatchOrFallback(
+      AppMutations.markReadPatch(jidFull, false));
+    this._getChatState(jidFull).markedAsUnread = true;
+    this.emit('chat_read', { jid: jidFull, read: false, synced });
+    return synced;
+  }
+
+  // durationMs is how long from now to stay muted; 0 or omitted means until
+  // it is unmuted by hand. The wire carries an absolute end in milliseconds.
+  async muteChat(jid, durationMs) {
+    const jidFull = makeJid(jid);
+    const endMs   = (durationMs && durationMs > 0) ? Date.now() + durationMs : 0;
+    const synced  = await this._appStatePatchOrFallback(
+      AppMutations.mutePatch(jidFull, endMs || 1),
+      () => this._muteIq(jidFull, endMs ? Math.floor(endMs / 1000) : 0));
+    const chat = this._getChatState(jidFull);
+    chat.muted       = true;
+    chat.muteUntilMs = endMs || -1;
+    this.emit('chat_muted', { jid: jidFull, muted: true, until: chat.muteUntilMs, synced });
+    return synced;
+  }
+
+  async unmuteChat(jid) {
+    const jidFull = makeJid(jid);
+    const synced  = await this._appStatePatchOrFallback(
+      AppMutations.mutePatch(jidFull, 0),
+      () => this._muteIq(jidFull, null));
+    const chat = this._getChatState(jidFull);
+    chat.muted       = false;
+    chat.muteUntilMs = 0;
+    this.emit('chat_muted', { jid: jidFull, muted: false, synced });
+    return synced;
+  }
+
+  // The mute a primary sends for itself. A companion never uses this — its
+  // mutes travel as app state so the phone learns about them.
+  _muteIq(jidFull, untilSeconds) {
+    const attrs = { jid: jidFull, add: untilSeconds === null ? '0' : '1' };
+    if (untilSeconds) attrs.t = String(untilSeconds);
+    return this._sendIq(new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      to:    's.whatsapp.net',
+      type:  'set',
+      xmlns: 'w:web'
+    }, [new BinaryNode('mute', attrs, null)]));
+  }
+
+  // Block a contact. Returns the updated block list.
+  async blockContact(jid) {
+    return this._updateBlocklist(jid, 'block');
+  }
+
+  // Unblock a contact. Returns the updated block list.
+  async unblockContact(jid) {
+    return this._updateBlocklist(jid, 'unblock');
+  }
+
+  // Work out the LID a block list item has to be addressed with, and the phone
+  // JID that goes beside it.
+  //
+  // The server only accepts LID-addressed items on a LID account: a phone JID
+  // comes back as <error code="400" text="bad-request" addressing_mode="lid"/>,
+  // the attribute being the server saying which addressing it wanted. When the
+  // mapping is not known yet a contact usync fetches it.
+  async _resolveBlockTarget(jid) {
+    const norm = toNonAdJid(makeJid(jid));
+    const user = norm.split('@')[0];
+
+    if (norm.endsWith('@lid')) {
+      const pn = this._lidToPn.get(user);
+      return { lid: norm, pn: pn ? pn + '@s.whatsapp.net' : null };
+    }
+
+    let lidUser = this._pnToLid.get(user);
+    if (!lidUser && this._devMgr) {
+      _whaDbg('[DBG] BLOCK_LID_LOOKUP ' + user);
+      try { await this._devMgr._doContactUsync([user]); } catch (_) {}
+      lidUser = this._pnToLid.get(user);
+    }
+    return { lid: lidUser ? lidUser + '@lid' : null, pn: norm };
+  }
+
+  // The one IQ behind both:
+  //
+  //   <iq xmlns="blocklist" type="set" to="s.whatsapp.net">
+  //     <item action="block" jid="<LID>" pn_jid="<phone JID>"/>
+  //   </iq>
+  //
+  // The item is addressed by LID, and a block carries the phone number beside
+  // it; an unblock carries only the LID. That is the shape this server accepts
+  // — sending the plain JID it was handed, which is what this used to do, got a
+  // 400 bad-request back.
+  //
+  // Three other things were wrong with the pair this replaces. The jid went out
+  // as a raw string rather than a binary JID. It was not reduced to its bare
+  // user first, so naming a contact with a device suffix sent a device JID
+  // there is nothing to block. And the reply was thrown away without being
+  // looked at, so a refusal came back looking exactly like a success.
+  async _updateBlocklist(jid, action) {
+    const { lid, pn } = await this._resolveBlockTarget(jid);
+    if (!lid) {
+      throw new Boom(action + 'Contact: could not resolve a LID for ' + jid +
+        ' — the server only accepts LID-addressed block list items. ' +
+        'Check the number is on WhatsApp.', { statusCode: 404 });
+    }
+    const attrs = { action, jid: jidStrToObj(lid) };
+    if (action === 'block') {
+      if (!pn) {
+        throw new Boom('blockContact: no phone number known for ' + lid +
+          ' — a block has to carry pn_jid beside the LID.', { statusCode: 404 });
+      }
+      attrs.pn_jid = jidStrToObj(pn);
+    }
+
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'blocklist',
+      to:    's.whatsapp.net',
+      type:  'set'
+    }, [
+      new BinaryNode('item', attrs, null)
+    ]);
+
+    const resp = await this._sendIq(node);
+    if (!resp) {
+      throw new Boom(action + 'Contact: no reply from server (IQ timed out)', { statusCode: 408 });
+    }
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      const text    = errNode && errNode.attrs && errNode.attrs.text;
+      throw new Boom(action + 'Contact: server rejected the request' +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+    }
+    // The server answers with the whole list as it now stands.
+    return this._parseBlocklist(findChild(resp, 'list')).jids;
+  }
+
+  // ─── Chat state ───────────────────────────────────────────────────────────
+  //
+  // Pinning, archiving, muting, marking read and starring are not local
+  // preferences — they are app state, which is how a change reaches the phone
+  // and every other linked device. Each of these writes a patch and waits for
+  // the server to take it; the local view only moves once it has.
+  //
+  // These used to set a field on an in-memory object and emit an event, so a
+  // pin lasted until the process exited and never appeared anywhere else.
+
+  async pinChat(jid) {
+    const jidFull = makeJid(jid);
+    const synced  = await this._appStatePatchOrFallback(AppMutations.pinPatch(jidFull, true));
+    this._getChatState(jidFull).pinnedAt = Math.floor(Date.now() / 1000);
+    this.emit('chat_pinned', { jid: jidFull, pinned: true, synced });
+    return synced;
+  }
+
+  async unpinChat(jid) {
+    const jidFull = makeJid(jid);
+    const synced  = await this._appStatePatchOrFallback(AppMutations.pinPatch(jidFull, false));
+    this._getChatState(jidFull).pinnedAt = 0;
+    this.emit('chat_pinned', { jid: jidFull, pinned: false, synced });
+    return synced;
+  }
+
+  async archiveChat(jid) {
+    const jidFull = makeJid(jid);
+    const synced  = await this._appStatePatchOrFallback(AppMutations.archivePatch(jidFull, true));
+    this._getChatState(jidFull).archived = true;
+    this.emit('chat_archived', { jid: jidFull, archived: true, synced });
+    return synced;
+  }
+
+  async unarchiveChat(jid) {
+    const jidFull = makeJid(jid);
+    const synced  = await this._appStatePatchOrFallback(AppMutations.archivePatch(jidFull, false));
+    this._getChatState(jidFull).archived = false;
+    this.emit('chat_archived', { jid: jidFull, archived: false, synced });
+    return synced;
+  }
+
+  // fromMe says whether the message being starred is one of ours. It is part of
+  // the index, so getting it wrong stars a different message — or nothing.
+  async starMessage(msgId, chatJid, fromMe) {
+    return this._setStar(msgId, chatJid, fromMe, true);
+  }
+
+  async unstarMessage(msgId, chatJid, fromMe) {
+    return this._setStar(msgId, chatJid, fromMe, false);
+  }
+
+  async _setStar(msgId, chatJid, fromMe, starred) {
+    const jidFull = makeJid(chatJid);
+    const synced  = await this._appStatePatchOrFallback(
+      AppMutations.starPatch(jidFull, msgId, !!fromMe, starred));
+    if (!this._starredMessages) this._starredMessages = new Set();
+    const key = jidFull + ':' + msgId;
+    if (starred) this._starredMessages.add(key); else this._starredMessages.delete(key);
+    this.emit('message_starred',
+      { msgId, chatJid: jidFull, starred, fromMe: !!fromMe, synced });
+    return synced;
+  }
+
+  // Mark a voice/audio message as played (sends 'played' receipt)
+  markMessagePlayed(msgId, from) {
+    if (!this._socket || !this._connected) return;
+    this._socket.sendNode(new BinaryNode('receipt', {
+      id:   msgId,
+      type: 'played',
+      to:   from
+    }, null));
+  }
+
+  // Set disappearing messages timer
+  // seconds: 0 = off, 86400 = 1 day, 604800 = 1 week, 7776000 = 90 days
+  async changeEphemeralTimer(jid, seconds) {
+    const jidFull = makeJid(jid);
+    const isGroup = jidFull.endsWith('@g.us');
+    if (isGroup) {
+      const id = this._genMsgId();
+      const body = seconds === 0
+        ? new BinaryNode('not_ephemeral', {}, null)
+        : new BinaryNode('ephemeral', { expiration: String(seconds) }, null);
+      const node = new BinaryNode('iq', {
+        id,
+        xmlns: 'w:g2',
+        to:    jidFull,
+        type:  'set'
+      }, [body]);
+      return this._sendIq(node);
+    } else {
+      if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+      return this._sender.sendEphemeralTimerDM(jidFull, seconds);
+    }
+  }
+
+  // Set global default ephemeral timer for new chats
+  async changeNewChatsEphemeralTimer(seconds) {
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'disappearing_mode',
+      to:    's.whatsapp.net',
+      type:  'set'
+    }, [
+      new BinaryNode('disappearing_mode', { duration: String(seconds) }, null)
+    ]);
+    return this._sendIq(node);
+  }
+
+  // Helper: get or create per-chat state object (for mobile local operations)
+  _getChatState(jid) {
+    const key = makeJid(jid);
+    if (!this._chatStates) this._chatStates = {};
+    if (!this._chatStates[key]) this._chatStates[key] = {};
+    return this._chatStates[key];
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // CALL LINKS
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Ask the server for a call link that can be shared in a chat, so the other
+  // side joins by tapping it instead of being rung.
+  //
+  //   type  'audio' (default) or 'video'
+  //   opts  { startTime } — seconds since the epoch, to schedule the call
+  //
+  // Returns { token, link, type }. The stanza is the one WhatsApp Web sends:
+  // <call to="@call"><link_create media="..."/></call>, answered with the token
+  // on a link_create of its own.
+  async createCallLink(type, opts) {
+    opts = opts || {};
+    const media = type === 'video' ? 'video' : 'audio';
+    const id    = this._genMsgId();
+    const children = opts.startTime
+      ? [new BinaryNode('event', { start_time: String(opts.startTime) }, null)]
+      : null;
+
+    const resp = await this._sendIq(new BinaryNode('call', { id, to: '@call' }, [
+      new BinaryNode('link_create', { media }, children)
+    ]));
+
+    if (!resp) throw new Boom('createCallLink: no reply from server (timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('createCallLink: server rejected the request' +
+        (code ? ' (' + code + ')' : ''), { statusCode: statusFrom(code) });
+    }
+    const created = findChild(resp, 'link_create');
+    const token   = created && created.attrs && created.attrs.token;
+    if (!token) throw new Boom('createCallLink: server reply carried no token', { statusCode: 502 });
+
+    const prefix = media === 'video' ? CALL_VIDEO_PREFIX : CALL_AUDIO_PREFIX;
+    return { token: String(token), link: prefix + token, type: media };
+  }
+
+  // Create a call link and send it as a message in one step.
+  // Returns the send result with the link attached.
+  async sendCallLink(to, type, opts) {
+    opts = opts || {};
+    const { link } = await this.createCallLink(type, opts);
+    const text = opts.text ? (opts.text + ' ' + link) : link;
+    const res  = await this.sendText(to, text, opts);
+    return Object.assign({}, res, { link });
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // GROUP OPERATIONS
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Create a group
+  // participants: array of phone numbers or JIDs
+  // Create a group.
+  //
+  // opts: { ephemeralSeconds, announce, locked, joinApprovalRequired,
+  //         memberAddMode, parent, linkedParentJid }
+  //
+  // Every participant goes out as a binary JID (a raw string is dropped for an
+  // @lid), a LID participant also carries the phone number the server matches it
+  // against, and each carries our privacy token so the invitation is not treated
+  // as an anonymous reach-out. The setting nodes are siblings of the
+  // participants inside <create>.
+  async createGroup(subject, participants, opts) {
+    opts = opts || {};
+    const id       = this._genMsgId();
+    // participant nodes MUST use attr `jid`, not `value`
+    const partNodes = (participants || []).map(p => {
+      // A participant is the person, never one of their devices — a JID that
+      // still carries a device suffix is not one the server will match.
+      const jid   = toNonAdJid(makeJid(p));
+      const attrs = { jid: jidStrToObj(jid) };
+      if (jid.endsWith('@lid')) {
+        const pn = this._lidToPn.get(jid.split('@')[0].split(':')[0]);
+        if (pn) attrs.phone_number = jidStrToObj(pn + '@s.whatsapp.net');
+      }
+      const token    = this._tcTokenFor(jid);
+      const children = token ? [new BinaryNode('privacy', {}, token)] : null;
+      return new BinaryNode('participant', attrs, children);
+    });
+
+    const settingNodes = [];
+    if (opts.parent) {
+      settingNodes.push(new BinaryNode('parent', {
+        default_membership_approval_mode:
+          opts.defaultMembershipApprovalMode || 'request_required'
+      }, null));
+    } else if (opts.linkedParentJid) {
+      settingNodes.push(new BinaryNode('linked_parent', {
+        jid: jidStrToObj(makeJid(opts.linkedParentJid))
+      }, null));
+    }
+    if (opts.locked)   settingNodes.push(new BinaryNode('locked', {}, null));
+    if (opts.announce) settingNodes.push(new BinaryNode('announcement', {}, null));
+    if (opts.ephemeralSeconds) {
+      // trigger="1" has to travel alongside the expiration; without it the
+      // server accepts the group but leaves disappearing messages off.
+      settingNodes.push(new BinaryNode('ephemeral', {
+        expiration: String(opts.ephemeralSeconds),
+        trigger:    '1'
+      }, null));
+    }
+    if (opts.joinApprovalRequired) {
+      settingNodes.push(new BinaryNode('membership_approval_mode', {}, [
+        new BinaryNode('group_join', { state: 'on' }, null)
+      ]));
+    }
+    if (opts.memberAddMode) {
+      settingNodes.push(new BinaryNode('member_add_mode', {},
+        Buffer.from(String(opts.memberAddMode), 'utf8')));
+    }
+
+    // `key` is what the server echoes back on the group-create notification so
+    // the client can tell its own creation apart from one it merely witnessed.
+    // A per-second value collides when two groups are made in the same second;
+    // a message id does not.
+    const baseAttrs = { subject, key: this._genMsgId() };
+    const createChildren = [...partNodes, ...settingNodes];
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    'g.us',
+      type:  'set'
+    }, [new BinaryNode('create', baseAttrs, createChildren)]);
+    const resp = await this._sendIq(node);
+    // These used to return null indistinguishably, which surfaced to the CLI as
+    // a bare "no response" no matter what actually went wrong.
+    if (!resp) {
+      throw new Boom('createGroup: no reply from server (IQ timed out)', { statusCode: 408 });
+    }
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      const text    = errNode && errNode.attrs && errNode.attrs.text;
+      throw new Boom('createGroup: server rejected the request' +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+    }
+    const createNode = findChild(resp, 'create');
+    const groupNode  = createNode ? findChild(createNode, 'group') : findChildDeep(resp, 'group');
+    if (!groupNode) {
+      throw new Boom('createGroup: server reply contained no <group> node', { statusCode: 502 });
+    }
+    return this._parseGroupNode(groupNode);
+  }
+
+  // Leave a group
+  // MUST send to 'g.us', not to the group JID
+  async leaveGroup(groupJid) {
+    const jid = makeJid(groupJid);
+    const id  = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    'g.us',
+      type:  'set'
+    }, [
+      new BinaryNode('leave', {}, [
+        new BinaryNode('group', { id: jid }, null)
+      ])
+    ]);
+    return this._sendIq(node);
+  }
+
+  // Add participants to group.
+  //
+  // Returns one result per participant, successes and failures alike — see
+  // _groupParticipantAction. A participant refused with 403 usually carries an
+  // `addRequest`, which sendGroupInvite() turns into an invitation they can act
+  // on themselves.
+  async addGroupParticipants(groupJid, jids) {
+    return this._groupParticipantAction(groupJid, 'add', jids);
+  }
+
+  // Remove participants from group
+  async removeGroupParticipants(groupJid, jids) {
+    return this._groupParticipantAction(groupJid, 'remove', jids);
+  }
+
+  // Promote participants to admin
+  async promoteGroupParticipants(groupJid, jids) {
+    return this._groupParticipantAction(groupJid, 'promote', jids);
+  }
+
+  // Demote admins to participants
+  async demoteGroupParticipants(groupJid, jids) {
+    return this._groupParticipantAction(groupJid, 'demote', jids);
+  }
+
+  // Internal: execute action on participants (add/remove/promote/demote)
+  // participant nodes MUST use attr `jid`, not `value`
+  async _groupParticipantAction(groupJid, action, jids) {
+    const gJid = makeJid(groupJid);
+    const arr  = Array.isArray(jids) ? jids : [jids];
+    // Binary JIDs, and on an add, the phone number behind a LID plus our
+    // privacy token for them.
+    const participantNodes = arr.map(j => {
+      const jid   = toNonAdJid(makeJid(j));
+      const attrs = { jid: jidStrToObj(jid) };
+      let children = null;
+      if (action === 'add') {
+        if (jid.endsWith('@lid')) {
+          const pn = this._lidToPn.get(jid.split('@')[0].split(':')[0]);
+          if (pn) attrs.phone_number = jidStrToObj(pn + '@s.whatsapp.net');
+        }
+        const token = this._tcTokenFor(jid);
+        if (token) children = [new BinaryNode('privacy', {}, token)];
+      }
+      return new BinaryNode('participant', attrs, children);
+    });
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    jidStrToObj(gJid),
+      type:  'set'
+    }, [
+      new BinaryNode(action, {}, participantNodes)
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom(action + ': no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      const text    = errNode && errNode.attrs && errNode.attrs.text;
+      throw new Boom(action + ': server rejected the request' +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+    }
+    const actionNode = findChild(resp, action);
+    if (!actionNode) {
+      throw new Boom(action + ': server reply contained no <' + action + '> node', { statusCode: 502 });
+    }
+    // The membership changed, so anything we have cached about the group is now
+    // one edit behind.
+    this.invalidateGroupMetadata(gJid);
+    return parseParticipantNodes(actionNode);
+  }
+
+  // Change group name/subject
+  async changeGroupSubject(groupJid, subject) {
+    const gJid = makeJid(groupJid);
+    const id   = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    jidStrToObj(gJid),
+      type:  'set'
+    }, [
+      new BinaryNode('subject', {}, Buffer.from(subject, 'utf8'))
+    ]);
+    const resp = await this._sendIq(node);
+    this.invalidateGroupMetadata(gJid);
+    return resp;
+  }
+
+  // Change group description
+  // description: string or null/'' to remove
+  //
+  // prev=<current topic id> has to go out with the edit so the server can reject
+  // one made against a description someone else has already replaced. Without it
+  // the change is refused. The current id is looked up from the group metadata
+  // when the caller does not supply one.
+  async changeGroupDescription(groupJid, description, opts) {
+    opts = opts || {};
+    const gJid = makeJid(groupJid);
+    const id   = this._genMsgId();
+    const isDelete = description == null || description === '';
+
+    let prevId = opts.prevId;
+    if (prevId === undefined) {
+      try {
+        const meta = await this.getGroupMetadata(gJid);
+        prevId = meta && meta.descriptionId;
+      } catch (_) { prevId = null; }
+    }
+
+    const descAttrs = { id: opts.newId || this._genMsgId() };
+    if (prevId) descAttrs.prev = prevId;
+    let children = [new BinaryNode('body', {}, Buffer.from(String(description), 'utf8'))];
+    if (isDelete) {
+      descAttrs.delete = 'true';
+      children = null;
+    }
+
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    jidStrToObj(gJid),
+      type:  'set'
+    }, [
+      new BinaryNode('description', descAttrs, children)
+    ]);
+    const resp = await this._sendIq(node);
+    this.invalidateGroupMetadata(gJid);
+    return resp;
+  }
+
+  // ─── Group settings ───────────────────────────────────────────────────────
+  //
+  // Both are a single empty node whose TAG carries the state — there is no
+  // attribute form of these.
+
+  // announce=true → only admins can send messages
+  async setGroupAnnounce(groupJid, announce) {
+    return this._groupSettingIq(groupJid, announce ? 'announcement' : 'not_announcement');
+  }
+
+  // locked=true → only admins can edit group info (subject, description, icon)
+  async setGroupLocked(groupJid, locked) {
+    return this._groupSettingIq(groupJid, locked ? 'locked' : 'unlocked');
+  }
+
+  // mode=true → new members must be approved by an admin
+  async setGroupJoinApprovalMode(groupJid, mode) {
+    return this._groupSettingIq(groupJid, 'membership_approval_mode', [
+      new BinaryNode('group_join', { state: mode ? 'on' : 'off' }, null)
+    ]);
+  }
+
+  // mode: 'all_member_add' | 'admin_add'
+  async setGroupMemberAddMode(groupJid, mode) {
+    return this._groupSettingIq(groupJid, 'member_add_mode',
+      Buffer.from(String(mode), 'utf8'));
+  }
+
+  // content is passed to the setting node verbatim: null for the flag settings
+  // whose state lives in the tag, child nodes for membership_approval_mode, raw
+  // bytes for member_add_mode.
+  async _groupSettingIq(groupJid, tag, content) {
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'w:g2',
+      to:    jidStrToObj(makeJid(groupJid)),
+      type:  'set'
+    }, [
+      new BinaryNode(tag, {}, content === undefined ? null : content)
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom(tag + ': no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      const text    = errNode && errNode.attrs && errNode.attrs.text;
+      throw new Boom(tag + ': server rejected the request' +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+    }
+    // The group's own view of these flags is now stale.
+    this.invalidateGroupMetadata(groupJid);
+    return resp;
+  }
+
+  // Change group picture.
+  //
+  // buf: Buffer with JPEG image data, or null to remove the current picture.
+  // Returns the new picture id, or 'remove' when the picture was taken down.
+  //
+  // Removal is the IQ with no body at all — an empty <picture> node is a
+  // malformed upload rather than a delete, and the server answers 406 for it.
+  //
+  // The image is re-encoded to a square 640x640 JPEG first, on the same terms
+  // as a profile picture; { raw: true } skips that.
+  async changeGroupPicture(groupJid, buf, opts) {
+    opts = opts || {};
+    const picture = (buf && !opts.raw) ? await prepareProfilePicture(buf, opts) : buf;
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns:  'w:profile:picture',
+      target: jidStrToObj(makeJid(groupJid)),
+      to:     's.whatsapp.net',
+      type:   'set'
+    }, picture ? [new BinaryNode('picture', { type: 'image' }, picture)] : null);
+    const resp = await this._sendIq(node);
+    if (!resp) {
+      throw new Boom('changeGroupPicture: no reply from server (IQ timed out). ' +
+        'The server drops a picture it will not take rather than refusing it, so ' +
+        'this usually means the image was not in the form it wants.', { statusCode: 408 });
+    }
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      if (String(code) === '406') {
+        throw new Boom(_pictureRejected('changeGroupPicture', picture, buf, opts), { statusCode: 406 });
+      }
+      throw new Boom('changeGroupPicture: ' +
+        (String(code) === '403' ? 'you are not allowed to change this group picture'
+       : 'server rejected the request' + (code ? ' (' + code + ')' : '')), { statusCode: statusFrom(code) });
+    }
+    if (!buf) return 'remove';
+    const picNode = findChild(resp, 'picture');
+    return (picNode && picNode.attrs && picNode.attrs.id)
+      ? String(picNode.attrs.id) : null;
+  }
+
+  // Get the group's invite link.
+  //
+  // reset=true revokes the current link and returns a freshly minted one — the
+  // same IQ with type="set" instead of "get".
+  async queryGroupInviteLink(groupJid, reset) {
+    const code = await this._queryGroupInviteCode(groupJid, reset);
+    return code ? INVITE_LINK_PREFIX + code : null;
+  }
+
+  // Revoke the current invite link and return the replacement.
+  async revokeGroupInviteLink(groupJid) {
+    return this.queryGroupInviteLink(groupJid, true);
+  }
+
+  // Join a group from an invite link or bare code.
+  // Returns the JID of the group that was joined. When the group requires admin
+  // approval the server answers with a membership_approval_request instead, and
+  // that JID is returned — the join is pending, not complete.
+  async joinGroupWithLink(inviteCodeOrUrl) {
+    const code = stripInviteUrl(inviteCodeOrUrl);
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'w:g2',
+      to:    'g.us',
+      type:  'set'
+    }, [new BinaryNode('invite', { code }, null)]);
+
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom('joinGroupWithLink: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const codeAttr = errNode && errNode.attrs && errNode.attrs.code;
+      // 410 is a revoked link, 406 an invalid one. Anything else is passed
+      // through as the server worded it.
+      const reason = String(codeAttr) === '410' ? 'the invite link has been revoked'
+                   : String(codeAttr) === '406' ? 'the invite link is not valid'
+                   : 'server rejected the request' +
+                     (codeAttr ? ' (' + codeAttr + ')' : '');
+      throw new Boom('joinGroupWithLink: ' + reason, { statusCode: statusFrom(codeAttr) });
+    }
+    const pending = findChild(resp, 'membership_approval_request');
+    if (pending && pending.attrs && pending.attrs.jid) {
+      return { jid: String(pending.attrs.jid), pendingApproval: true };
+    }
+    const grp = findChild(resp, 'group');
+    if (!grp || !grp.attrs || !grp.attrs.jid) {
+      throw new Boom('joinGroupWithLink: server reply contained no <group> node', { statusCode: 502 });
+    }
+    return { jid: String(grp.attrs.jid), pendingApproval: false };
+  }
+
+  // queryGroupInviteInfo — fetch group metadata from an invite link code
+  // Returns parsed group metadata (same shape as getGroupMetadata) or null.
+  // inviteCode is the bare code (no URL prefix needed; URL also accepted).
+  async queryGroupInviteInfo(inviteCodeOrUrl) {
+    const code = stripInviteUrl(inviteCodeOrUrl);
+    const id   = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    'g.us',
+      type:  'get'
+    }, [
+      new BinaryNode('invite', { code }, null)
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return null;
+    const grp = findChild(resp, 'group');
+    if (!grp) return null;
+    return this._parseGroupNode(grp);
+  }
+
+  async _queryGroupInviteCode(groupJid, reset) {
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    jidStrToObj(makeJid(groupJid)),
+      type:  reset ? 'set' : 'get'
+    }, [
+      new BinaryNode('invite', {}, null)
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return null;
+    const inv = findChild(resp, 'invite');
+    return (inv && inv.attrs && inv.attrs.code) || null;
+  }
+
+  // Revoke group invite
+  // Revoke the current invite link. Returns the replacement link.
+  //
+  // This threw the reply away, so a caller had no way to learn the new code and
+  // had to query the link again. It is the same IQ revokeGroupInviteLink sends.
+  async revokeGroupInvite(groupJid) {
+    return this.revokeGroupInviteLink(groupJid);
+  }
+
+  // Join a group by invite code or full link. Returns the group JID, or null.
+  //
+  // Accepts a full https://chat.whatsapp.com/... link as well as a bare code —
+  // it used to pass whatever it was given straight through as the code, so a
+  // pasted link was rejected. A group that gates joins on admin approval answers
+  // with membership_approval_request rather than group; that JID is returned too
+  // (use joinGroupWithLink when you need to tell the two apart).
+  async acceptGroupInvite(inviteCodeOrUrl) {
+    const r = await this.joinGroupWithLink(inviteCodeOrUrl).catch(() => null);
+    return r ? r.jid : null;
+  }
+
+  // Change group settings
+  // setting: 'edit_group_info' | 'send_messages' | 'add_participants' | 'approve_participants'
+  // policy:  'admins' | 'all'
+  async changeGroupSetting(groupJid, setting, policy) {
+    const id     = this._genMsgId();
+    const admins = policy === 'admins';
+    let   body;
+    switch (setting) {
+      case 'edit_group_info':
+        body = new BinaryNode(admins ? 'locked' : 'unlocked', {}, null);
+        break;
+      case 'send_messages':
+        body = new BinaryNode(admins ? 'announcement' : 'not_announcement', {}, null);
+        break;
+      case 'add_participants':
+        body = new BinaryNode('member_add_mode', {},
+          Buffer.from(admins ? 'admin_add' : 'all_member_add', 'utf8'));
+        break;
+      case 'approve_participants':
+        body = new BinaryNode('membership_approval_mode', {}, [
+          new BinaryNode('group_join', { state: admins ? 'on' : 'off' }, null)
+        ]);
+        break;
+      default:
+        throw new Boom('Unknown group setting: ' + setting, { statusCode: 400 });
+    }
+    // Routed through the shared helper so a refusal from the server (not an
+    // admin, not a member) surfaces as an error instead of resolving null, and
+    // so the group's cached metadata does not keep reporting the old flags.
+    return this._groupSettingIq(groupJid, body.description, body.content);
+  }
+
+  // Query participants pending approval.
+  //
+  // Each entry stringifies to the JID and also carries `requestedAt`, the unix
+  // second the person asked to join, so a list can be shown oldest-first.
+  async queryGroupPendingParticipants(groupJid) {
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    jidStrToObj(makeJid(groupJid)),
+      type:  'get'
+    }, [
+      new BinaryNode('membership_approval_requests', {}, null)
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) return [];
+    const reqNode = findChild(resp, 'membership_approval_requests');
+    if (!reqNode || !Array.isArray(reqNode.content)) return [];
+    return reqNode.content
+      .filter(n => n && n.description === 'membership_approval_request')
+      .map(parseJoinRequestNode)
+      .filter(Boolean);
+  }
+
+  // Approve or reject pending join requests.
+  //
+  // Returns one result per participant, refusals included, on the same terms as
+  // the add/remove/promote/demote actions.
+  async approveGroupParticipants(groupJid, approve, jids) {
+    const gJid    = makeJid(groupJid);
+    const arr     = Array.isArray(jids) ? jids : [jids];
+    const action  = approve ? 'approve' : 'reject';
+    const partNodes = arr.map(j =>
+      new BinaryNode('participant', { jid: jidStrToObj(toNonAdJid(makeJid(j))) }, null)
+    );
+    const id = this._genMsgId();
+    const node = new BinaryNode('iq', {
+      id,
+      xmlns: 'w:g2',
+      to:    jidStrToObj(gJid),
+      type:  'set'
+    }, [
+      new BinaryNode('membership_requests_action', {}, [
+        new BinaryNode(action, {}, partNodes)
+      ])
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom(action + ': no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const code    = errNode && errNode.attrs && errNode.attrs.code;
+      const text    = errNode && errNode.attrs && errNode.attrs.text;
+      throw new Boom(action + ': server rejected the request' +
+        (code ? ' (' + code + (text ? ' ' + text : '') + ')' : ''), { statusCode: statusFrom(code) });
+    }
+    const actionNode = findChildDeep(resp, action);
+    if (!actionNode) {
+      throw new Boom(action + ': server reply contained no <' + action + '> node', { statusCode: 502 });
+    }
+    this.invalidateGroupMetadata(gJid);
+    return parseParticipantNodes(actionNode);
+  }
+
+  // ─── Personal group invitations ───────────────────────────────────────────
+  //
+  // A group invite link is public: anyone holding it can join. These three are
+  // the other kind — an invitation minted for one named person, which is the
+  // only way into a group for someone whose privacy settings stop them from
+  // being added outright. The code comes back attached to the refusal from
+  // addGroupParticipants (`result.addRequest`), travels to them as a message
+  // built by sendGroupInvite, and is spent by acceptGroupInviteMessage.
+
+  // Send someone a personal invitation to a group.
+  //
+  // opts: { groupName, caption, jpegThumbnail, isCommunity, id, contextInfo }
+  //
+  // The group name is filled in from the group's own metadata when the caller
+  // does not supply one, so the bubble does not arrive nameless.
+  async sendGroupInvite(to, groupJid, inviteCode, inviteExpiration, opts) {
+    if (!this._sender || !this._connected) throw new Boom('Not connected', { statusCode: 428 });
+    opts = opts || {};
+    const gJid = makeJid(groupJid);
+    let groupName = opts.groupName;
+    if (groupName === undefined) {
+      try {
+        const meta = await this.getGroupMetadata(gJid);
+        groupName = (meta && meta.subject) || '';
+      } catch (_) { groupName = ''; }
+    }
+    return this._sender.sendGroupInvite(to, gJid, inviteCode, inviteExpiration,
+      Object.assign({}, opts, { groupName }));
+  }
+
+  // Look at a group behind a personal invitation without accepting it.
+  //
+  // inviterJid is who sent the invitation; code and expiration come from the
+  // invite message itself.
+  async queryGroupInviteMessageInfo(groupJid, inviterJid, code, expiration) {
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'w:g2',
+      to:    jidStrToObj(makeJid(groupJid)),
+      type:  'get'
+    }, [
+      new BinaryNode('query', {}, [
+        new BinaryNode('add_request', {
+          code:       String(code),
+          expiration: String(expiration || 0),
+          admin:      jidStrToObj(makeJid(inviterJid))
+        }, null)
+      ])
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom('queryGroupInviteMessageInfo: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const errCode = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('queryGroupInviteMessageInfo: ' +
+        (String(errCode) === '410' ? 'the invitation has expired'
+       : String(errCode) === '406' ? 'the invitation is not valid'
+       : 'server rejected the request' + (errCode ? ' (' + errCode + ')' : '')), { statusCode: statusFrom(errCode) });
+    }
+    const grp = findChild(resp, 'group');
+    if (!grp) throw new Boom('queryGroupInviteMessageInfo: server reply contained no <group> node', { statusCode: 502 });
+    return this._parseGroupNode(grp);
+  }
+
+  // Accept a personal invitation. Returns the JID of the group joined.
+  async acceptGroupInviteMessage(groupJid, inviterJid, code, expiration) {
+    const gJid = makeJid(groupJid);
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'w:g2',
+      to:    jidStrToObj(gJid),
+      type:  'set'
+    }, [
+      new BinaryNode('accept', {
+        code:       String(code),
+        expiration: String(expiration || 0),
+        admin:      jidStrToObj(makeJid(inviterJid))
+      }, null)
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom('acceptGroupInviteMessage: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const errCode = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('acceptGroupInviteMessage: ' +
+        (String(errCode) === '410' ? 'the invitation has expired'
+       : String(errCode) === '406' ? 'the invitation is not valid'
+       : 'server rejected the request' + (errCode ? ' (' + errCode + ')' : '')), { statusCode: statusFrom(errCode) });
+    }
+    this.invalidateGroupMetadata(gJid);
+    return (resp.attrs && resp.attrs.from) ? String(resp.attrs.from) : gJid;
+  }
+
+  // Withdraw a personal invitation you sent, before it is used.
+  async revokeGroupInviteForParticipant(groupJid, invitedJid) {
+    const node = new BinaryNode('iq', {
+      id:    this._genMsgId(),
+      xmlns: 'w:g2',
+      to:    jidStrToObj(makeJid(groupJid)),
+      type:  'set'
+    }, [
+      new BinaryNode('revoke', {}, [
+        new BinaryNode('participant', { jid: jidStrToObj(toNonAdJid(makeJid(invitedJid))) }, null)
+      ])
+    ]);
+    const resp = await this._sendIq(node);
+    if (!resp) throw new Boom('revokeGroupInviteForParticipant: no reply from server (IQ timed out)', { statusCode: 408 });
+    if (resp.attrs && resp.attrs.type === 'error') {
+      const errNode = findChild(resp, 'error');
+      const errCode = errNode && errNode.attrs && errNode.attrs.code;
+      throw new Boom('revokeGroupInviteForParticipant: server rejected the request' +
+        (errCode ? ' (' + errCode + ')' : ''), { statusCode: statusFrom(errCode) });
+    }
+    return true;
+  }
+
+  // Add participants, and for every one the server refuses because they cannot
+  // be added directly, send them a personal invitation instead.
+  //
+  // Returns the same list addGroupParticipants returns, with `invited` set on
+  // the entries an invitation went out to.
+  async addGroupParticipantsOrInvite(groupJid, jids, opts) {
+    opts = opts || {};
+    const gJid    = makeJid(groupJid);
+    const results = await this.addGroupParticipants(gJid, jids);
+    const pending = results.filter(r => r.needsInvite);
+    if (!pending.length) return results;
+
+    let groupName = opts.groupName;
+    if (groupName === undefined) {
+      try {
+        const meta = await this.getGroupMetadata(gJid);
+        groupName = (meta && meta.subject) || '';
+      } catch (_) { groupName = ''; }
+    }
+
+    for (const r of pending) {
+      try {
+        await this.sendGroupInvite(r.jid, gJid, r.addRequest.code,
+          r.addRequest.expiration, Object.assign({}, opts, { groupName }));
+        r.invited = true;
+      } catch (err) {
+        r.invited = false;
+        r.inviteError = err.message || String(err);
+      }
+    }
+    return results;
+  }
+}
+
+module.exports = {
+  WhalibmobClient,
+  checkIfRegistered,
+  checkNumberStatus,
+  requestSmsCode,
+  verifyCode,
+  assertRegistrationKeys,
+  fetchIosVersion,
+  fetchWaVersion,
+  getDeviceConfig,
+  createNewStore,
+  saveStore,
+  loadStore,
+  toSixParts,
+  fromSixParts
+};

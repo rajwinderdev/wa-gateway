@@ -57,6 +57,46 @@ router.post('/start', async (req, res) => {
 });
 
 /**
+ * POST /sessions/request-otp
+ * Direct SMS OTP Request for Virtual Numbers (DualSMS)
+ * Body: { phone, name?, os? }
+ */
+router.post('/request-otp', async (req, res) => {
+  const { phone, name, os } = req.body;
+  if (!phone || typeof phone !== 'string') {
+    return res.status(400).json({ ok: false, error: 'missing_or_invalid_phone' });
+  }
+
+  try {
+    const result = await sessionManager.requestOtp({ phone, name, os });
+    return res.json(result);
+  } catch (err) {
+    logger.error({ phone, error: err.message }, 'Error in request-otp endpoint');
+    return res.status(400).json({ ok: false, error: err.message || 'failed_to_request_otp' });
+  }
+});
+
+/**
+ * POST /sessions/verify-otp
+ * Verify SMS OTP Code from DualSMS and Connect Virtual Number
+ * Body: { phone, code }
+ */
+router.post('/verify-otp', async (req, res) => {
+  const { phone, code } = req.body;
+  if (!phone || !code) {
+    return res.status(400).json({ ok: false, error: 'phone_and_code_required' });
+  }
+
+  try {
+    const result = await sessionManager.verifyOtp({ phone, code });
+    return res.json(result);
+  } catch (err) {
+    logger.error({ phone, code, error: err.message }, 'Error in verify-otp endpoint');
+    return res.status(400).json({ ok: false, error: err.message || 'otp_verification_failed' });
+  }
+});
+
+/**
  * GET /sessions/:session_key/status
  */
 router.get('/:session_key/status', async (req, res) => {
