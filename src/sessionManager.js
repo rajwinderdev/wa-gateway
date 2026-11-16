@@ -363,7 +363,7 @@ class SessionManager {
   }
 
   /**
-   * Direct SMS OTP registration for virtual numbers (e.g. from DualSMS)
+   * Direct SMS OTP registration for virtual numbers
    */
   async requestOtp({ phone, name, os = 'ios' }) {
     const cleanPhone = String(phone).replace(/\D/g, '');
@@ -401,7 +401,7 @@ class SessionManager {
         ok: true,
         phone: cleanPhone,
         status: (res && res.status) || 'sent',
-        message: 'SMS verification code requested successfully. Check DualSMS inbox.'
+        message: 'SMS verification code requested successfully. Check your SMS inbox.'
       };
     } catch (err) {
       logger.error({ phone: cleanPhone, error: err.message }, 'Failed to request SMS code');

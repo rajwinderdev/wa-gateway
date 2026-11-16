@@ -42,7 +42,8 @@ app.get('/health', (req, res) => {
   const mem = process.memoryUsage();
   return res.json({
     ok: true,
-    version: '1.1.0',
+    name: 'WhatsApp Dynamic Multi-Session Gateway',
+    version: '1.2.0',
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount(),
     memory_mb: Math.round(mem.rss / (1024 * 1024))
@@ -55,8 +56,8 @@ app.get('/version', (req, res) => {
   return res.json({
     ok: true,
     version: '1.2.0',
-    updated_at: '2026-11-16 21:15:00',
-    changelog: 'Dual Engine Gateway: Baileys companion + Whalibmob Direct SMS OTP Registration for DualSMS virtual numbers, dynamic warmup capacity',
+    updated_at: '2026-11-16 21:30:00',
+    changelog: 'Multi-Engine Gateway: Baileys companion + Direct SMS OTP Registration for virtual numbers, dynamic warmup capacity',
     engines: ['baileys', 'whalibmob'],
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount(),

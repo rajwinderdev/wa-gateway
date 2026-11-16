@@ -58,7 +58,7 @@ router.post('/start', async (req, res) => {
 
 /**
  * POST /sessions/request-otp
- * Direct SMS OTP Request for Virtual Numbers (DualSMS)
+ * Direct SMS OTP Request for Virtual Numbers
  * Body: { phone, name?, os? }
  */
 router.post('/request-otp', async (req, res) => {
@@ -78,7 +78,7 @@ router.post('/request-otp', async (req, res) => {
 
 /**
  * POST /sessions/verify-otp
- * Verify SMS OTP Code from DualSMS and Connect Virtual Number
+ * Verify SMS OTP Code and Connect Virtual Number
  * Body: { phone, code }
  */
 router.post('/verify-otp', async (req, res) => {
