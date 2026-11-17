@@ -50,13 +50,6 @@ router.post('/check', async (req, res) => {
             exists: Boolean(onWa && onWa.exists),
             jid: onWa && onWa.jid ? onWa.jid : undefined
           });
-        } else {
-          // Whalibmob fallback
-          results.push({
-            number: cleanDigits,
-            exists: true,
-            jid
-          });
         }
       } catch (lookupErr) {
         logger.debug({ number: cleanDigits, error: lookupErr.message }, 'Failed single onWhatsApp lookup');

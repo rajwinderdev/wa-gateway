@@ -8,7 +8,6 @@ const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
 const { NodeCache } = require('@cacheable/node-cache');
-const mob = require('./whalibmob');
 const { useMySQLAuthState } = require('./mysqlAuthState');
 const { sendWebhook } = require('./webhook');
 const { getPool } = require('./utils/db');
@@ -21,11 +20,6 @@ class SessionManager {
   constructor() {
     this.sessions = new Map(); // sessionKey -> sessionObject
     this.maxSessions = parseInt(process.env.MAX_SESSIONS || '50', 10);
-    this.mobSessionDir = path.resolve(process.env.MOB_SESSION_DIR || path.join(__dirname, '..', 'sessions', 'mob'));
-    if (!fs.existsSync(this.mobSessionDir)) {
-      fs.mkdirSync(this.mobSessionDir, { recursive: true });
-    }
-    this.pendingRegistrations = new Map(); // phone -> { store, sessFile, requestedAt }
   }
 
   getSessionCount() {
@@ -421,205 +415,6 @@ class SessionManager {
   }
 
   /**
-   * Direct SMS OTP registration for virtual numbers
-   */
-  async requestOtp({ phone, name, os = 'ios' }) {
-    const cleanPhone = String(phone).replace(/\D/g, '');
-    if (!cleanPhone || cleanPhone.length < 8) {
-      throw new Error('invalid_phone_number');
-    }
-
-    if (!fs.existsSync(this.mobSessionDir)) {
-      fs.mkdirSync(this.mobSessionDir, { recursive: true });
-    }
-
-    const sessDir = path.join(this.mobSessionDir, cleanPhone);
-    if (!fs.existsSync(sessDir)) {
-      fs.mkdirSync(sessDir, { recursive: true });
-    }
-
-    const sessFile = mob.storeFileFor(this.mobSessionDir, cleanPhone);
-    const store = mob.createNewStore(cleanPhone, { name: name || 'Support' });
-    mob.saveStore(store, sessFile);
-
-    // Set requested platform
-    if (os && os.toLowerCase() === 'android') {
-      process.env.WA_OS = 'android';
-    } else {
-      process.env.WA_OS = 'ios';
-    }
-
-    logger.info({ phone: cleanPhone, os: process.env.WA_OS }, 'Requesting WhatsApp SMS OTP for direct virtual registration');
-    try {
-      const res = await mob.requestSmsCode(store, 'sms', { name: name || 'Support' });
-      mob.saveStore(store, sessFile);
-      this.pendingRegistrations.set(cleanPhone, { store, sessFile, requestedAt: Date.now() });
-
-      return {
-        ok: true,
-        phone: cleanPhone,
-        status: (res && res.status) || 'sent',
-        message: 'SMS verification code requested successfully. Check your SMS inbox.'
-      };
-    } catch (err) {
-      logger.error({ phone: cleanPhone, error: err.message }, 'Failed to request SMS code');
-      throw err;
-    }
-  }
-
-  /**
-   * Verify SMS OTP code and connect virtual number
-   */
-  async verifyOtp({ phone, code }) {
-    const cleanPhone = String(phone).replace(/\D/g, '');
-    const cleanCode = String(code).trim().replace(/\D/g, '');
-
-    if (!cleanPhone || cleanCode.length < 4) {
-      throw new Error('invalid_phone_or_code');
-    }
-
-    const sessFile = mob.storeFileFor(this.mobSessionDir, cleanPhone);
-    let pending = this.pendingRegistrations.get(cleanPhone);
-    let store = pending ? pending.store : null;
-
-    if (!store) {
-      if (fs.existsSync(sessFile)) {
-        store = mob.loadStore(sessFile);
-      }
-    }
-
-    if (!store) {
-      throw new Error('No pending registration found for this number. Please request SMS code first.');
-    }
-
-    logger.info({ phone: cleanPhone, code: cleanCode }, 'Submitting OTP to WhatsApp for verification');
-    const result = await mob.verifyCode(store, cleanCode);
-
-    if (result && ['ok', 'sent', 'verified'].includes(result.status)) {
-      store.registered = true;
-      store.codePending = false;
-      const canonical = store.phoneNumber || cleanPhone;
-      const targetFile = mob.storeFileFor(this.mobSessionDir, canonical);
-      mob.saveStore(store, targetFile);
-
-      this.pendingRegistrations.delete(cleanPhone);
-
-      // Start the live mobile client session
-      const sessionKey = 'vpool_' + canonical;
-      await this.startMobSession(canonical);
-
-      return {
-        ok: true,
-        phone: canonical,
-        session_key: sessionKey,
-        status: 'connected',
-        message: 'Virtual number verified and connected successfully!'
-      };
-    } else {
-      const reason = (result && result.reason) || 'OTP verification failed';
-      logger.warn({ phone: cleanPhone, result, reason }, 'Verification returned non-ok status');
-      throw new Error(reason);
-    }
-  }
-
-  /**
-   * Initialize and connect a Whalibmob client session
-   */
-  async startMobSession(phone) {
-    const cleanPhone = String(phone).replace(/\D/g, '');
-    const sessionKey = 'vpool_' + cleanPhone;
-
-    let existing = this.sessions.get(sessionKey);
-    if (existing && existing.status === 'connected' && existing.mobClient) {
-      return existing;
-    }
-
-    const client = new mob.WhalibmobClient({
-      sessionDir: this.mobSessionDir,
-      autoFixNumber: true,
-      refreshVersion: false,
-      pino: false
-    });
-
-    const sessionObj = {
-      sessionKey,
-      phone: cleanPhone,
-      name: (client._store && client._store.name) || 'Virtual SIM',
-      type: 'whalibmob',
-      sock: null,
-      mobClient: client,
-      status: 'connecting',
-      queue: Promise.resolve(),
-      startedAt: new Date()
-    };
-
-    this.sessions.set(sessionKey, sessionObj);
-
-    client.on('connected', () => {
-      logger.info({ sessionKey, phone: cleanPhone }, 'Whalibmob Virtual Number connected successfully');
-      sessionObj.status = 'connected';
-      sendWebhook({
-        event: 'connection.update',
-        session_key: sessionKey,
-        status: 'connected',
-        phone: cleanPhone,
-        name: sessionObj.name
-      });
-    });
-
-    client.on('close', () => {
-      logger.warn({ sessionKey, phone: cleanPhone }, 'Whalibmob Virtual Number disconnected');
-      sessionObj.status = 'disconnected';
-      sendWebhook({
-        event: 'connection.update',
-        session_key: sessionKey,
-        status: 'disconnected',
-        phone: cleanPhone
-      });
-    });
-
-    client.on('temporary_ban', (evt) => {
-      logger.error({ sessionKey, phone: cleanPhone, event: evt }, 'Whalibmob Virtual Number temporarily banned');
-      sessionObj.status = 'banned';
-      sendWebhook({
-        event: 'connection.update',
-        session_key: sessionKey,
-        status: 'banned',
-        phone: cleanPhone
-      });
-    });
-
-    client.on('auth_failure', (evt) => {
-      logger.error({ sessionKey, phone: cleanPhone, event: evt }, 'Whalibmob Virtual Number auth failure');
-      sessionObj.status = 'disconnected';
-      sendWebhook({
-        event: 'connection.update',
-        session_key: sessionKey,
-        status: 'disconnected',
-        phone: cleanPhone
-      });
-    });
-
-    try {
-      await client.init(cleanPhone);
-      sessionObj.status = 'connected';
-      sendWebhook({
-        event: 'connection.update',
-        session_key: sessionKey,
-        status: 'connected',
-        phone: cleanPhone,
-        name: sessionObj.name
-      });
-    } catch (initErr) {
-      logger.error({ sessionKey, error: initErr.message }, 'Whalibmob client init error');
-      sessionObj.status = 'disconnected';
-      throw initErr;
-    }
-
-    return sessionObj;
-  }
-
-  /**
    * Log out session cleanly, deleting rows and memory state
    */
   async logoutSession(sessionKey) {
@@ -629,18 +424,6 @@ class SessionManager {
       const pool = getPool();
       await pool.query('DELETE FROM `wa_gw_auth` WHERE `session_key` = ?', [sessionKey]);
       return false;
-    }
-
-    if (session.type === 'whalibmob') {
-      try {
-        if (session.mobClient && typeof session.mobClient.close === 'function') {
-          session.mobClient.close();
-        }
-      } catch (e) {
-        logger.warn({ sessionKey, error: e.message }, 'Error closing Whalibmob client');
-      }
-      this.sessions.delete(sessionKey);
-      return true;
     }
 
     session.isExplicitLogout = true;
@@ -691,35 +474,6 @@ class SessionManager {
           }
         }, delay);
         delay += 2000; // 2 seconds staggered delay between each restore
-      }
-
-      // Also restore any registered Whalibmob sessions
-      if (fs.existsSync(this.mobSessionDir)) {
-        const entries = fs.readdirSync(this.mobSessionDir, { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.isDirectory()) {
-            const phone = entry.name;
-            const sessFile = mob.storeFileFor(this.mobSessionDir, phone);
-            if (fs.existsSync(sessFile)) {
-              try {
-                const store = mob.loadStore(sessFile);
-                if (store && store.registered) {
-                  setTimeout(async () => {
-                    try {
-                      logger.info({ phone }, 'Auto-restoring stored Whalibmob virtual number session');
-                      await this.startMobSession(phone);
-                    } catch (err) {
-                      logger.error({ phone, error: err.message }, 'Failed to auto-restore Whalibmob session');
-                    }
-                  }, delay);
-                  delay += 2000;
-                }
-              } catch (e) {
-                logger.warn({ phone, error: e.message }, 'Failed to inspect store for auto-restore');
-              }
-            }
-          }
-        }
       }
     } catch (e) {
       logger.error({ error: e.message }, 'Error querying stored sessions for restore');

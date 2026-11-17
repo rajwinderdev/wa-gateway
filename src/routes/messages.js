@@ -83,34 +83,6 @@ router.post('/send', async (req, res) => {
   try {
     // Process message through per-session sequential mutex/queue
     const sendResult = await sessionManager.enqueueSessionTask(session.sessionKey, async () => {
-      // Whalibmob Virtual Number routing
-      if (session.type === 'whalibmob' && session.mobClient) {
-        const typingDuration = Math.min(15000, Math.max(1000, parseInt(typing_ms || 1000, 10)));
-        await sleep(typingDuration);
-
-        let sendRes;
-        if (media_url) {
-          const { buffer, contentType } = await downloadMedia(media_url);
-          if (media_type === 'image' || (!media_type && contentType && contentType.startsWith('image/'))) {
-            sendRes = await session.mobClient.sendImage(jid, buffer, { caption: text || undefined });
-          } else if (media_type === 'video' || (!media_type && contentType && contentType.startsWith('video/'))) {
-            sendRes = await session.mobClient.sendVideo(jid, buffer, { caption: text || undefined });
-          } else {
-            sendRes = await session.mobClient.sendDocument(jid, buffer, { caption: text || undefined, fileName: file_name || 'document' });
-          }
-        } else {
-          sendRes = await session.mobClient.sendText(jid, text);
-        }
-
-        const msgId = (sendRes && sendRes.id) ? sendRes.id : ('mob_' + Date.now());
-        await sessionManager.saveMessageRef(session.sessionKey, msgId, client_ref);
-        return {
-          ok: true,
-          message_id: msgId,
-          status: 'sent'
-        };
-      }
-
       const sock = session.sock;
 
       // 2. If mark_read: send presence available and read chat messages

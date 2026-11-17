@@ -58,7 +58,7 @@ app.get('/version', (req, res) => {
     version: '1.2.1',
     updated_at: '2026-11-16 21:45:00',
     changelog: 'v1.2.1: Pre-key retry bundle handler for phone E2EE decryption (fixes Waiting for message), incoming STOP/Opt-out webhook event forwarding',
-    engines: ['baileys', 'whalibmob'],
+    engines: ['baileys'],
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount(),
     memory_mb: Math.round(mem.rss / (1024 * 1024))
