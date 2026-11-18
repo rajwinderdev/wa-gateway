@@ -43,7 +43,7 @@ app.get('/health', (req, res) => {
   return res.json({
     ok: true,
     name: 'WhatsApp Dynamic Multi-Session Gateway',
-    version: '1.2.1',
+    version: '1.3.0',
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount(),
     memory_mb: Math.round(mem.rss / (1024 * 1024))
@@ -55,9 +55,9 @@ app.get('/version', (req, res) => {
   const mem = process.memoryUsage();
   return res.json({
     ok: true,
-    version: '1.2.1',
-    updated_at: '2026-11-16 21:45:00',
-    changelog: 'v1.2.1: Pre-key retry bundle handler for phone E2EE decryption (fixes Waiting for message), incoming STOP/Opt-out webhook event forwarding',
+    version: '1.3.0',
+    updated_at: '2026-11-18 06:20:00',
+    changelog: 'v1.3.0: Removed experimental direct mobile protocol (whalibmob). Restored pure, stable Baileys Multi-Device engine with MySQL session pooling.',
     engines: ['baileys'],
     uptime: Math.floor(process.uptime()),
     sessions: sessionManager.getSessionCount(),
